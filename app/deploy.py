@@ -288,7 +288,14 @@ async def deploy():
     )
 
     # Execute an immediate collection task (single- or multi-account)
-    await _run_accounts(headless=headless)
+    if settings.TASK_TIMEOUT_SECONDS and settings.TASK_TIMEOUT_SECONDS > 0:
+        logger.debug(f"Enforcing overall TASK_TIMEOUT_SECONDS: {settings.TASK_TIMEOUT_SECONDS}s")
+        await asyncio.wait_for(
+            _run_accounts(headless=headless),
+            timeout=float(settings.TASK_TIMEOUT_SECONDS),
+        )
+    else:
+        await _run_accounts(headless=headless)
 
     # Skip scheduler setup if disabled in configuration
     if not settings.ENABLE_APSCHEDULER:

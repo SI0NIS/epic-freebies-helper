@@ -60,7 +60,7 @@ class EpicSettings(AgentConfig):
     )
 
     GLM_MODEL: str = Field(default="glm-4.6v", description="GLM vision-capable default model")
-    GLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=50.0, gt=5.0, le=120.0)
+    GLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=90.0, gt=5.0, le=180.0)
 
     BROWSER_BACKEND: str = Field(
         default="auto", description="Supported values: auto, camoufox, playwright"
@@ -92,7 +92,7 @@ class EpicSettings(AgentConfig):
 
     ENABLE_APSCHEDULER: bool = Field(default=True)
     TASK_TIMEOUT_SECONDS: int = Field(default=900)
-    AUTH_MAX_ATTEMPTS: int = Field(default=5, ge=3, le=8)
+    AUTH_MAX_ATTEMPTS: int = Field(default=2, ge=1, le=8)
     REDIS_URL: str = Field(default="redis://redis:6379/0")
     CELERY_WORKER_CONCURRENCY: int = Field(default=1)
     CELERY_TASK_TIME_LIMIT: int = Field(default=1200)

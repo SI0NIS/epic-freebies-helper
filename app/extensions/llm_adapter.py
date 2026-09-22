@@ -92,7 +92,12 @@ GLM_MULTI_TARGET_INSTRUCTION = (
 
 def _glm_thinking_payload(model: str, config: Any) -> dict[str, str] | None:
     """Keep GLM point-selection calls within hCaptcha response budgets."""
-    if not model.lower().startswith("glm-4.5"):
+    normalized = model.lower()
+    if not (
+        normalized.startswith("glm-4.5")
+        or normalized.startswith("glm-4.6")
+        or normalized.startswith("glm-4.7")
+    ):
         return None
     if getattr(config, "thinking_config", None) is None:
         return None

@@ -9,9 +9,15 @@ import cv2
 import httpx
 import numpy as np
 from hcaptcha_challenger.agent.challenger import AgentV, RoboticArm
-from hcaptcha_challenger.models import CaptchaResponse, PointCoordinate, SpatialPath
+from hcaptcha_challenger.models import (
+    CaptchaResponse,
+    ChallengeTypeEnum,
+    PointCoordinate,
+    RequestType,
+    SpatialPath,
+)
 from loguru import logger
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Locator, TimeoutError as PlaywrightTimeoutError
 
 from extensions.numbered_line_solver import solve_numbered_line_drag
 
@@ -672,24 +678,94 @@ def _apply_empty_checkcaptcha_patch() -> None:
     AgentV._task_handler = patched_task_handler
 
 
+def _patch_robotic_arm_safety() -> None:
+    if getattr(RoboticArm, "_epic_safety_patch", False):
+        return
+
+    orig_click_by_mouse = RoboticArm.click_by_mouse
+
+    async def safe_click_by_mouse(self: RoboticArm, locator: Locator) -> bool:
+        try:
+            bbox = await locator.bounding_box()
+            if bbox is None:
+                logger.warning("Locator has no bounding box; click aborted | locator={}", locator)
+                return False
+            center_x = bbox["x"] + bbox["width"] / 2
+            center_y = bbox["y"] + bbox["height"] / 2
+            await self.page.mouse.move(center_x, center_y)
+            await self.page.mouse.click(center_x, center_y, delay=150)
+            return True
+        except Exception as err:
+            logger.warning("Failed to click locator by mouse: {!r}", err)
+            return False
+
+    async def safe_refresh_challenge(self: RoboticArm) -> bool:
+        try:
+            refresh_frame = await self.get_challenge_frame_locator()
+            if refresh_frame is None:
+                logger.warning("Cannot find challenge frame to refresh")
+                return False
+            refresh_element = refresh_frame.locator("//div[@class='refresh button']")
+            if await refresh_element.is_visible(timeout=3000):
+                return await self.click_by_mouse(refresh_element)
+            logger.warning("Refresh button not visible in challenge frame")
+            return False
+        except Exception as err:
+            logger.warning("Failed to click refresh button: {!r}", err)
+            return False
+
+    orig_check_challenge_type = RoboticArm.check_challenge_type
+
+    async def safe_check_challenge_type(self: RoboticArm) -> RequestType | ChallengeTypeEnum | None:
+        try:
+            with suppress(Exception):
+                await self.page.wait_for_selector(self.challenge_selector, timeout=1000)
+
+            frame_challenge = await self.get_challenge_frame_locator()
+            if frame_challenge is None:
+                logger.warning("Cannot find valid challenge frame in check_challenge_type")
+                return None
+
+            return await orig_check_challenge_type(self)
+        except Exception as err:
+            logger.warning("Error checking challenge type: {!r}", err)
+            return None
+
+    RoboticArm.click_by_mouse = safe_click_by_mouse
+    RoboticArm.refresh_challenge = safe_refresh_challenge
+    RoboticArm.check_challenge_type = safe_check_challenge_type
+    RoboticArm._epic_safety_patch = True
+
+
 def apply_hcaptcha_drag_patch() -> None:
     _apply_empty_checkcaptcha_patch()
+    _patch_robotic_arm_safety()
 
     if not getattr(RoboticArm.challenge_image_label_select, "_epic_point_bounds_patch", False):
 
         async def patched_challenge_image_label_select(self: RoboticArm, job_type: Any):
             frame_challenge = await self.get_challenge_frame_locator()
+            if frame_challenge is None:
+                logger.warning("Challenge frame not found before crumb loop; refreshing")
+                await self.refresh_challenge()
+                return
+
             crumb_count = await self.check_crumb_count()
             cache_key = self.config.create_cache_key(self.captcha_payload)
 
             for cid in range(crumb_count):
                 await self.page.wait_for_timeout(self.config.WAIT_FOR_CHALLENGE_VIEW_TO_RENDER_MS)
+                frame_challenge = await self.get_challenge_frame_locator()
+                if frame_challenge is None:
+                    logger.warning("Challenge frame lost at crumb {}/{}", cid + 1, crumb_count)
+                    await self.refresh_challenge()
+                    return
+
                 raw, projection = await self._capture_spatial_mapping(
                     frame_challenge, cache_key, cid
                 )
-                challenge_bbox = await frame_challenge.locator(
-                    "//div[@class='challenge-view']"
-                ).bounding_box()
+                challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
+                challenge_bbox = await challenge_view.bounding_box()
                 base_prompt = self._match_user_prompt(job_type)
                 image_grid_bounds = (
                     _detect_clickable_grid_bounds(raw)
@@ -721,6 +797,7 @@ def apply_hcaptcha_drag_patch() -> None:
                     logger.warning(
                         "Rejected unsafe hCaptcha point answer | reason={}", validation_error
                     )
+                    await self.refresh_challenge()
                     raise ValueError(f"Unsafe hCaptcha point answer: {validation_error}")
 
                 self._spatial_point_reasoner.cache_response(
@@ -742,15 +819,25 @@ def apply_hcaptcha_drag_patch() -> None:
 
     async def patched_challenge_image_drag_drop(self: RoboticArm, job_type: Any):
         frame_challenge = await self.get_challenge_frame_locator()
+        if frame_challenge is None:
+            logger.warning("Challenge frame not found before drag loop; refreshing")
+            await self.refresh_challenge()
+            return
+
         crumb_count = await self.check_crumb_count()
         cache_key = self.config.create_cache_key(self.captcha_payload)
 
         for cid in range(crumb_count):
             await self.page.wait_for_timeout(self.config.WAIT_FOR_CHALLENGE_VIEW_TO_RENDER_MS)
+            frame_challenge = await self.get_challenge_frame_locator()
+            if frame_challenge is None:
+                logger.warning("Challenge frame lost at crumb {}/{}", cid + 1, crumb_count)
+                await self.refresh_challenge()
+                return
+
             raw, projection = await self._capture_spatial_mapping(frame_challenge, cache_key, cid)
-            challenge_bbox = await frame_challenge.locator(
-                "//div[@class='challenge-view']"
-            ).bounding_box()
+            challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
+            challenge_bbox = await challenge_view.bounding_box()
             user_prompt = self._match_user_prompt(job_type)
             paths = _resolve_line_path(
                 captcha_payload=self.captcha_payload,
