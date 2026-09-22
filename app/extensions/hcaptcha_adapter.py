@@ -706,10 +706,9 @@ def _patch_robotic_arm_safety() -> None:
                 logger.warning("Cannot find challenge frame to refresh")
                 return False
             refresh_element = refresh_frame.locator("//div[@class='refresh button']")
-            if await refresh_element.is_visible(timeout=3000):
-                return await self.click_by_mouse(refresh_element)
-            logger.warning("Refresh button not visible in challenge frame")
-            return False
+            with suppress(Exception):
+                await refresh_element.wait_for(state="visible", timeout=3000)
+            return await self.click_by_mouse(refresh_element)
         except Exception as err:
             logger.warning("Failed to click refresh button: {!r}", err)
             return False
@@ -734,6 +733,75 @@ def _patch_robotic_arm_safety() -> None:
     RoboticArm.click_by_mouse = safe_click_by_mouse
     RoboticArm.refresh_challenge = safe_refresh_challenge
     RoboticArm.check_challenge_type = safe_check_challenge_type
+
+    orig_solve_captcha = AgentV._solve_captcha
+
+    async def safe_solve_captcha(self: AgentV):
+        challenge_type = await self._review_challenge_type()
+        if challenge_type is None:
+            logger.warning("Challenge type is None; refreshing challenge")
+            await self.page.wait_for_timeout(2000)
+            await self.robotic_arm.refresh_challenge()
+            challenge_type = await self._review_challenge_type()
+            if challenge_type is None:
+                logger.warning("Challenge type still None after refresh; returning")
+                return None
+
+        type_str = getattr(challenge_type, "value", str(challenge_type))
+        logger.debug(
+            f"Start Challenge - type={type_str} count={self.robotic_arm.signal_crumb_count}"
+        )
+
+        try:
+            with suppress(Exception):
+                if self.config.ignore_request_questions and self._captcha_payload:
+                    for q in self.config.ignore_request_questions:
+                        if q in self._captcha_payload.get_requester_question():
+                            await self.page.wait_for_timeout(2000)
+                            await self.robotic_arm.refresh_challenge()
+                            return await self._solve_captcha()
+
+            match challenge_type:
+                case RequestType.IMAGE_LABEL_BINARY:
+                    if RequestType.IMAGE_LABEL_BINARY not in self.config.ignore_request_types:
+                        return await self.robotic_arm.challenge_image_label_binary()
+                case ChallengeTypeEnum.IMAGE_LABEL_SINGLE_SELECT:
+                    if (
+                        RequestType.IMAGE_LABEL_AREA_SELECT not in self.config.ignore_request_types
+                        and ChallengeTypeEnum.IMAGE_LABEL_SINGLE_SELECT not in self.config.ignore_request_types
+                    ):
+                        return await self.robotic_arm.challenge_image_label_select(challenge_type)
+                case ChallengeTypeEnum.IMAGE_LABEL_MULTI_SELECT:
+                    if (
+                        RequestType.IMAGE_LABEL_AREA_SELECT not in self.config.ignore_request_types
+                        and ChallengeTypeEnum.IMAGE_LABEL_MULTI_SELECT not in self.config.ignore_request_types
+                    ):
+                        return await self.robotic_arm.challenge_image_label_select(challenge_type)
+                case ChallengeTypeEnum.IMAGE_DRAG_SINGLE:
+                    if (
+                        RequestType.IMAGE_DRAG_DROP not in self.config.ignore_request_types
+                        and ChallengeTypeEnum.IMAGE_DRAG_SINGLE not in self.config.ignore_request_types
+                    ):
+                        return await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                case ChallengeTypeEnum.IMAGE_DRAG_MULTI:
+                    if (
+                        RequestType.IMAGE_DRAG_DROP not in self.config.ignore_request_types
+                        and ChallengeTypeEnum.IMAGE_DRAG_MULTI not in self.config.ignore_request_types
+                    ):
+                        return await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                case _:
+                    logger.warning(f"Unknown types of challenges: {challenge_type}")
+
+            await self.page.wait_for_timeout(2000)
+            await self.robotic_arm.refresh_challenge()
+            return await self._solve_captcha()
+        except Exception as err:
+            logger.warning(f"ChallengeException - type={type_str} err={err!r}")
+            await self.page.wait_for_timeout(3000)
+            await self.robotic_arm.refresh_challenge()
+            return await self._solve_captcha()
+
+    AgentV._solve_captcha = safe_solve_captcha
     RoboticArm._epic_safety_patch = True
 
 
@@ -787,6 +855,24 @@ def apply_hcaptcha_drag_patch() -> None:
                     auxiliary_information=user_prompt,
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
+
+                # Normalize coordinates: If model returned coordinates relative to challenge view
+                # (0..width, 0..height), translate them to absolute page coordinates.
+                if challenge_bbox is not None and getattr(response, "points", None):
+                    bx = float(challenge_bbox["x"])
+                    by = float(challenge_bbox["y"])
+                    bw = float(challenge_bbox["width"])
+                    bh = float(challenge_bbox["height"])
+                    for pt in response.points:
+                        px = float(pt.x)
+                        py = float(pt.y)
+                        if 0 <= px <= bw and 0 <= py <= bh and (px < bx or py < by):
+                            logger.info(
+                                "Translating challenge-relative coordinate ({:.1f}, {:.1f}) to page coordinate ({:.1f}, {:.1f})",
+                                px, py, px + bx, py + by
+                            )
+                            pt.x = px + bx
+                            pt.y = py + by
 
                 validation_error = _point_answer_validation_error(
                     response.points,

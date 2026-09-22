@@ -288,11 +288,22 @@ async def deploy():
     )
 
     # Execute an immediate collection task (single- or multi-account)
-    if settings.TASK_TIMEOUT_SECONDS and settings.TASK_TIMEOUT_SECONDS > 0:
-        logger.debug(f"Enforcing overall TASK_TIMEOUT_SECONDS: {settings.TASK_TIMEOUT_SECONDS}s")
+    raw = get_epic_accounts_raw()
+    account_count = 1
+    if raw:
+        parsed, _ = parse_multi_accounts(raw)
+        if parsed:
+            account_count = max(len(parsed), 1)
+
+    timeout_seconds = float(settings.TASK_TIMEOUT_SECONDS) if settings.TASK_TIMEOUT_SECONDS and settings.TASK_TIMEOUT_SECONDS > 0 else 0
+    if timeout_seconds > 0 and account_count > 1:
+        timeout_seconds = max(timeout_seconds, account_count * 900.0)
+
+    if timeout_seconds > 0:
+        logger.debug(f"Enforcing overall TASK_TIMEOUT_SECONDS: {timeout_seconds}s for {account_count} account(s)")
         await asyncio.wait_for(
             _run_accounts(headless=headless),
-            timeout=float(settings.TASK_TIMEOUT_SECONDS),
+            timeout=timeout_seconds,
         )
     else:
         await _run_accounts(headless=headless)
