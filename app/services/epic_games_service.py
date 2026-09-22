@@ -198,8 +198,8 @@ class EpicAgent:
                 raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
 
             status = await self._get_login_status(timeout_ms=1500)
-            if status in {"true", "false"}:
-                return status
+            if status == "true":
+                return "true"
 
             if not account_probe_attempted and time.monotonic() >= account_probe_at:
                 account_probe_attempted = True
@@ -208,9 +208,12 @@ class EpicAgent:
                 )
                 if await self._has_account_session():
                     return "true"
+                url_store_login = f"https://www.epicgames.com/id/login?lang=en-US&noHostRedirect=true&redirectUrl={URL_CLAIM}"
+                with suppress(Exception):
+                    await self.page.goto(url_store_login, wait_until="domcontentloaded", timeout=15000)
                 await self._goto_claim_page()
 
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(1000)
 
         if self._needs_mfa_setup_prompt():
             raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))

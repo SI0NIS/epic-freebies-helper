@@ -927,8 +927,23 @@ def apply_hcaptcha_drag_patch() -> None:
 
                     valid_points = []
                     for pt in response.points:
-                        px = float(pt.x)
-                        py = float(pt.y)
+                        orig_x = float(pt.x)
+                        orig_y = float(pt.y)
+                        px = orig_x
+                        py = orig_y
+
+                        # Translate relative coordinates if the model output them from origin 0..bw, 0..bh
+                        # Only translate if px is strictly less than x_min - 30 (e.g. 233 when x_min=390)
+                        if (0 <= px <= bw) and (px < x_min - 30):
+                            px += bx
+                        if (0 <= py <= bh) and (py < y_min - 30):
+                            py += by
+
+                        if px != orig_x or py != orig_y:
+                            logger.info(
+                                "Translated relative coordinate ({:.1f}, {:.1f}) -> page coordinate ({:.1f}, {:.1f})",
+                                orig_x, orig_y, px, py
+                            )
 
                         # Check whether coordinates are within a reasonable margin of the challenge bounding box
                         margin = 120.0

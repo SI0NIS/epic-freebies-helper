@@ -485,6 +485,21 @@ class EpicAuthorization:
 
                 raise RuntimeError(error_code)
 
+            # Check for Epic login form error alert banner
+            with suppress(Exception):
+                error_banner = self.page.locator("//div[contains(@class, 'error') or contains(@role, 'alert') or contains(@class, 'Alert')]").first
+                if await error_banner.is_visible(timeout=100):
+                    banner_text = (await error_banner.text_content() or "").strip()
+                    if "refresh the page" in banner_text.lower() or "incorrect response" in banner_text.lower():
+                        logger.warning(
+                            "Epic login reported: '{}'; clearing cookies and refreshing login entry",
+                            banner_text,
+                        )
+                        await self.page.context.clear_cookies()
+                        await self.page.goto(point_url, wait_until="domcontentloaded")
+                        await self._wait_for_login_form(point_url)
+                        raise RuntimeError("epic_login_incorrect_response_refresh_required")
+
             if not self._is_login_success_signal.empty():
                 await self._is_login_success_signal.get()
                 return
@@ -666,26 +681,25 @@ class EpicAuthorization:
                 await self._goto_claim_page()
                 continue
 
-            status = await self._get_login_status(timeout_ms=1500)
+            status = await self._get_login_status(timeout_ms=1500, warn_timeout=False)
             if status == "true":
                 return
-            if status == "false":
-                raise RuntimeError(
-                    "Epic store still reports isloggedin=false after authentication. "
-                    f"current_url={self.page.url}"
-                )
 
             if not account_probe_attempted and time.monotonic() >= account_probe_at:
                 account_probe_attempted = True
                 logger.warning(
-                    "Epic navigation login marker did not appear after authentication; "
-                    "probing account session via order history."
+                    "Epic navigation login marker is not true (status={}); triggering store SSO redirect",
+                    status,
                 )
                 if await self._has_account_session():
+                    logger.success("Epic store session confirmed via account order history probe")
                     return
+                url_store_login = f"https://www.epicgames.com/id/login?lang=en-US&noHostRedirect=true&redirectUrl={URL_CLAIM}"
+                with suppress(Exception):
+                    await self.page.goto(url_store_login, wait_until="domcontentloaded", timeout=15000)
                 await self._goto_claim_page()
 
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(1000)
 
         if self._needs_mfa_setup_prompt():
             raise EpicManualActionRequiredError(self._mfa_setup_prompt_message(self.page.url))
