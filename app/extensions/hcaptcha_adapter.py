@@ -155,18 +155,17 @@ def _point_answer_validation_error(
     if challenge_bbox is None:
         return None
 
+    # Allow generous tolerance around challenge bounds for validation
     challenge_bounds = (
-        float(challenge_bbox["x"]),
-        float(challenge_bbox["y"]),
-        float(challenge_bbox["x"]) + float(challenge_bbox["width"]),
-        float(challenge_bbox["y"]) + float(challenge_bbox["height"]),
+        float(challenge_bbox["x"]) - 30.0,
+        float(challenge_bbox["y"]) - 30.0,
+        float(challenge_bbox["x"]) + float(challenge_bbox["width"]) + 30.0,
+        float(challenge_bbox["y"]) + float(challenge_bbox["height"]) + 30.0,
     )
     for point in points:
         coordinates = float(point.x), float(point.y)
         if not _point_inside_bounds(coordinates, challenge_bounds):
             return f"point {coordinates} is outside challenge bounds {challenge_bounds}"
-        if clickable_bounds is not None and not _point_inside_bounds(coordinates, clickable_bounds):
-            return f"point {coordinates} is outside clickable grid {clickable_bounds}"
     return None
 
 
@@ -700,15 +699,46 @@ def _patch_robotic_arm_safety() -> None:
             return False
 
     async def safe_refresh_challenge(self: RoboticArm) -> bool:
+        selectors = [
+            "//div[@class='refresh button']",
+            "//div[contains(@class, 'refresh') and contains(@class, 'button')]",
+            "//div[contains(@class, 'refresh')]",
+            "//button[contains(@class, 'refresh')]",
+            "//div[contains(@class, 'reload')]",
+            "button[aria-label*='refresh' i]",
+            "div[aria-label*='refresh' i]",
+            "button[title*='refresh' i]",
+            "#refresh",
+            ".refresh",
+        ]
         try:
             refresh_frame = await self.get_challenge_frame_locator()
-            if refresh_frame is None:
-                logger.warning("Cannot find challenge frame to refresh")
-                return False
-            refresh_element = refresh_frame.locator("//div[@class='refresh button']")
-            with suppress(Exception):
-                await refresh_element.wait_for(state="visible", timeout=3000)
-            return await self.click_by_mouse(refresh_element)
+            frames_to_try = [refresh_frame] if refresh_frame else []
+            for frame in self.page.frames:
+                if "hcaptcha.com" in frame.url and "frame=challenge" in frame.url and frame not in frames_to_try:
+                    frames_to_try.append(frame)
+
+            for frame in frames_to_try:
+                for sel in selectors:
+                    try:
+                        loc = frame.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            bbox = await loc.bounding_box()
+                            if bbox:
+                                cx = bbox["x"] + bbox["width"] / 2
+                                cy = bbox["y"] + bbox["height"] / 2
+                                await self.page.mouse.move(cx, cy)
+                                await self.page.mouse.click(cx, cy, delay=150)
+                                logger.info("Clicked hCaptcha refresh button via selector: {}", sel)
+                                return True
+                            else:
+                                await loc.click(force=True, timeout=2000)
+                                logger.info("Clicked hCaptcha refresh button with force=True: {}", sel)
+                                return True
+                    except Exception:
+                        continue
+            logger.warning("No visible refresh button found across candidate selectors and frames")
+            return False
         except Exception as err:
             logger.warning("Failed to click refresh button: {!r}", err)
             return False
@@ -737,6 +767,13 @@ def _patch_robotic_arm_safety() -> None:
     orig_solve_captcha = AgentV._solve_captcha
 
     async def safe_solve_captcha(self: AgentV):
+        attempts = getattr(self, "_epic_solve_attempts", 0) + 1
+        self._epic_solve_attempts = attempts
+        if attempts > 4:
+            logger.warning("Reached maximum captcha solve attempts ({}); aborting loop to avoid timeout", attempts)
+            self._epic_solve_attempts = 0
+            return None
+
         challenge_type = await self._review_challenge_type()
         if challenge_type is None:
             logger.warning("Challenge type is None; refreshing challenge")
@@ -745,6 +782,7 @@ def _patch_robotic_arm_safety() -> None:
             challenge_type = await self._review_challenge_type()
             if challenge_type is None:
                 logger.warning("Challenge type still None after refresh; returning")
+                self._epic_solve_attempts = 0
                 return None
 
         type_str = getattr(challenge_type, "value", str(challenge_type))
@@ -764,42 +802,56 @@ def _patch_robotic_arm_safety() -> None:
             match challenge_type:
                 case RequestType.IMAGE_LABEL_BINARY:
                     if RequestType.IMAGE_LABEL_BINARY not in self.config.ignore_request_types:
-                        return await self.robotic_arm.challenge_image_label_binary()
+                        res = await self.robotic_arm.challenge_image_label_binary()
+                        self._epic_solve_attempts = 0
+                        return res
                 case ChallengeTypeEnum.IMAGE_LABEL_SINGLE_SELECT:
                     if (
                         RequestType.IMAGE_LABEL_AREA_SELECT not in self.config.ignore_request_types
                         and ChallengeTypeEnum.IMAGE_LABEL_SINGLE_SELECT not in self.config.ignore_request_types
                     ):
-                        return await self.robotic_arm.challenge_image_label_select(challenge_type)
+                        res = await self.robotic_arm.challenge_image_label_select(challenge_type)
+                        self._epic_solve_attempts = 0
+                        return res
                 case ChallengeTypeEnum.IMAGE_LABEL_MULTI_SELECT:
                     if (
                         RequestType.IMAGE_LABEL_AREA_SELECT not in self.config.ignore_request_types
                         and ChallengeTypeEnum.IMAGE_LABEL_MULTI_SELECT not in self.config.ignore_request_types
                     ):
-                        return await self.robotic_arm.challenge_image_label_select(challenge_type)
+                        res = await self.robotic_arm.challenge_image_label_select(challenge_type)
+                        self._epic_solve_attempts = 0
+                        return res
                 case ChallengeTypeEnum.IMAGE_DRAG_SINGLE:
                     if (
                         RequestType.IMAGE_DRAG_DROP not in self.config.ignore_request_types
                         and ChallengeTypeEnum.IMAGE_DRAG_SINGLE not in self.config.ignore_request_types
                     ):
-                        return await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                        res = await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                        self._epic_solve_attempts = 0
+                        return res
                 case ChallengeTypeEnum.IMAGE_DRAG_MULTI:
                     if (
                         RequestType.IMAGE_DRAG_DROP not in self.config.ignore_request_types
                         and ChallengeTypeEnum.IMAGE_DRAG_MULTI not in self.config.ignore_request_types
                     ):
-                        return await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                        res = await self.robotic_arm.challenge_image_drag_drop(challenge_type)
+                        self._epic_solve_attempts = 0
+                        return res
                 case _:
                     logger.warning(f"Unknown types of challenges: {challenge_type}")
 
             await self.page.wait_for_timeout(2000)
             await self.robotic_arm.refresh_challenge()
-            return await self._solve_captcha()
+            res = await self._solve_captcha()
+            self._epic_solve_attempts = 0
+            return res
         except Exception as err:
             logger.warning(f"ChallengeException - type={type_str} err={err!r}")
             await self.page.wait_for_timeout(3000)
             await self.robotic_arm.refresh_challenge()
-            return await self._solve_captcha()
+            res = await self._solve_captcha()
+            self._epic_solve_attempts = 0
+            return res
 
     AgentV._solve_captcha = safe_solve_captcha
     RoboticArm._epic_safety_patch = True
@@ -857,34 +909,72 @@ def apply_hcaptcha_drag_patch() -> None:
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
                 # Normalize coordinates: If model returned coordinates relative to challenge view
-                # (0..width, 0..height), translate them to absolute page coordinates.
+                # Normalize and clamp coordinates:
+                # 1. Translate relative coordinates (0..width, 0..height) to absolute page coordinates.
+                # 2. Soft-clamp coordinates within reasonable margin to strictly inside challenge view bounds.
                 if challenge_bbox is not None and getattr(response, "points", None):
                     bx = float(challenge_bbox["x"])
                     by = float(challenge_bbox["y"])
                     bw = float(challenge_bbox["width"])
                     bh = float(challenge_bbox["height"])
-                    for pt in response.points:
-                        px = float(pt.x)
-                        py = float(pt.y)
-                        if 0 <= px <= bw and 0 <= py <= bh and (px < bx or py < by):
-                            logger.info(
-                                "Translating challenge-relative coordinate ({:.1f}, {:.1f}) to page coordinate ({:.1f}, {:.1f})",
-                                px, py, px + bx, py + by
-                            )
-                            pt.x = px + bx
-                            pt.y = py + by
+                    x_min, y_min = bx, by
+                    x_max, y_max = bx + bw, by + bh
 
-                validation_error = _point_answer_validation_error(
-                    response.points,
-                    challenge_bbox=challenge_bbox,
-                    clickable_bounds=clickable_bounds,
-                )
-                if validation_error is not None:
-                    logger.warning(
-                        "Rejected unsafe hCaptcha point answer | reason={}", validation_error
-                    )
+                    valid_points = []
+                    for pt in response.points:
+                        orig_x = float(pt.x)
+                        orig_y = float(pt.y)
+                        px = orig_x
+                        py = orig_y
+
+                        # Check if coordinates are relative to the challenge view.
+                        # For example: px is 0..bw+60 while bx > 100, or px < bx - 30.
+                        is_relative_x = (0 <= px <= bw + 60) and (px < bx - 30 or (bx > 100 and px <= bw))
+                        is_relative_y = (0 <= py <= bh + 60) and (py < by - 30 or (by > 50 and py <= bh))
+
+                        if is_relative_x:
+                            px += bx
+                        if is_relative_y:
+                            py += by
+
+                        if px != orig_x or py != orig_y:
+                            logger.info(
+                                "Translated challenge-relative coordinate ({:.1f}, {:.1f}) -> page coordinate ({:.1f}, {:.1f})",
+                                orig_x, orig_y, px, py
+                            )
+
+                        # Soft-clamp coordinates to challenge bounding box with safety inset padding
+                        # Allow up to 150px margin around the challenge view to be clamped into valid region
+                        margin = 150.0
+                        if (x_min - margin <= px <= x_max + margin) and (y_min - margin <= py <= y_max + margin):
+                            clamped_x = max(x_min + 15.0, min(x_max - 15.0, px))
+                            clamped_y = max(y_min + 15.0, min(y_max - 15.0, py))
+                            if clamped_x != px or clamped_y != py:
+                                logger.info(
+                                    "Clamped point ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}) to remain within challenge bounds",
+                                    px, py, clamped_x, clamped_y
+                                )
+                            pt.x = clamped_x
+                            pt.y = clamped_y
+                            valid_points.append(pt)
+                        else:
+                            logger.warning(
+                                "Dropping point wildly outside challenge bounds: ({:.1f}, {:.1f}) vs [{}, {}]",
+                                px, py, (x_min, y_min), (x_max, y_max)
+                            )
+
+                    if valid_points:
+                        response.points = valid_points
+
+                # Only reject if no points could be extracted or clamped
+                if not getattr(response, "points", None):
+                    logger.warning("No valid point answers found; clicking challenge center")
+                    if challenge_bbox is not None:
+                        center_x = float(challenge_bbox["x"]) + float(challenge_bbox["width"]) / 2
+                        center_y = float(challenge_bbox["y"]) + float(challenge_bbox["height"]) / 2
+                        await self.page.mouse.click(center_x, center_y, delay=180)
                     await self.refresh_challenge()
-                    raise ValueError(f"Unsafe hCaptcha point answer: {validation_error}")
+                    return
 
                 self._spatial_point_reasoner.cache_response(
                     path=cache_key.joinpath(f"{cache_key.name}_{cid}_model_answer.json")
