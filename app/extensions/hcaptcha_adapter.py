@@ -908,10 +908,9 @@ def apply_hcaptcha_drag_patch() -> None:
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
-                # Normalize coordinates: If model returned coordinates relative to challenge view
-                # Normalize and clamp coordinates:
-                # 1. Translate relative coordinates (0..width, 0..height) to absolute page coordinates.
-                # 2. Soft-clamp coordinates within reasonable margin to strictly inside challenge view bounds.
+                # Clamp coordinates to challenge view bounds:
+                # Gemini outputs page coordinates directly matching the visual coordinate grid axes.
+                # Strictly clamp points within challenge bounds with safety inset padding.
                 if challenge_bbox is not None and getattr(response, "points", None):
                     bx = float(challenge_bbox["x"])
                     by = float(challenge_bbox["y"])
@@ -920,35 +919,22 @@ def apply_hcaptcha_drag_patch() -> None:
                     x_min, y_min = bx, by
                     x_max, y_max = bx + bw, by + bh
 
+                    # Target bounding box with inset padding:
+                    target_xmin = x_min + 15.0
+                    target_xmax = x_max - 15.0
+                    target_ymin = y_min + 15.0
+                    target_ymax = y_max - 15.0
+
                     valid_points = []
                     for pt in response.points:
-                        orig_x = float(pt.x)
-                        orig_y = float(pt.y)
-                        px = orig_x
-                        py = orig_y
+                        px = float(pt.x)
+                        py = float(pt.y)
 
-                        # Check if coordinates are relative to the challenge view.
-                        # For example: px is 0..bw+60 while bx > 100, or px < bx - 30.
-                        is_relative_x = (0 <= px <= bw + 60) and (px < bx - 30 or (bx > 100 and px <= bw))
-                        is_relative_y = (0 <= py <= bh + 60) and (py < by - 30 or (by > 50 and py <= bh))
-
-                        if is_relative_x:
-                            px += bx
-                        if is_relative_y:
-                            py += by
-
-                        if px != orig_x or py != orig_y:
-                            logger.info(
-                                "Translated challenge-relative coordinate ({:.1f}, {:.1f}) -> page coordinate ({:.1f}, {:.1f})",
-                                orig_x, orig_y, px, py
-                            )
-
-                        # Soft-clamp coordinates to challenge bounding box with safety inset padding
-                        # Allow up to 150px margin around the challenge view to be clamped into valid region
-                        margin = 150.0
+                        # Check whether coordinates are within a reasonable margin of the challenge bounding box
+                        margin = 120.0
                         if (x_min - margin <= px <= x_max + margin) and (y_min - margin <= py <= y_max + margin):
-                            clamped_x = max(x_min + 15.0, min(x_max - 15.0, px))
-                            clamped_y = max(y_min + 15.0, min(y_max - 15.0, py))
+                            clamped_x = max(target_xmin, min(target_xmax, px))
+                            clamped_y = max(target_ymin, min(target_ymax, py))
                             if clamped_x != px or clamped_y != py:
                                 logger.info(
                                     "Clamped point ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}) to remain within challenge bounds",

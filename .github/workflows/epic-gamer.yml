@@ -150,6 +150,18 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Sanitize runtime artifacts for upload
+        if: always()
+        run: |
+          if [ -d "app/volumes/hcaptcha/.challenge" ]; then
+            find app/volumes/hcaptcha/.challenge -depth -name "*[?*:\"<>|]*" | while IFS= read -r f; do
+              dir=$(dirname "$f")
+              base=$(basename "$f")
+              sanitized=$(echo "$base" | tr -d '?*:\"<>|')
+              mv "$f" "$dir/$sanitized" 2>/dev/null || true
+            done
+          fi
+
       - name: Upload runtime artifacts
         if: always()
         uses: actions/upload-artifact@v7
