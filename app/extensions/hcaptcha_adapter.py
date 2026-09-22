@@ -7,8 +7,13 @@ from typing import Any
 
 import cv2
 import httpx
+import matplotlib
 import numpy as np
 from hcaptcha_challenger.agent.challenger import AgentV, RoboticArm
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (must follow matplotlib.use)
+
 from hcaptcha_challenger.models import (
     CaptchaResponse,
     ChallengeTypeEnum,
@@ -23,6 +28,137 @@ from extensions.numbered_line_solver import solve_numbered_line_drag
 
 
 _EMPTY_CHECKCAPTCHA_GRACE_SECONDS = 5.0
+
+_GRID_TICK_INSTRUCTION = (
+    "Read every coordinate from the axis tick labels of the coordinate-grid image directly "
+    "(those ticks are labelled with page coordinates). Do not report raw pixel positions of "
+    "the rendered image."
+)
+
+# The upstream `create_coordinate_grid` helper renders the challenge screenshot into a
+# matplotlib figure (figsize 10x10 => 1000x1000 px) whose axis ticks are labelled with
+# *page* coordinates, expecting the model to read those ticks. GLM returns the pixel
+# coordinates of that rendered figure instead, so the plot area layout is reproduced once
+# here in order to convert model output back into page coordinates.
+GridGeometry = tuple[float, float, float, float]
+
+_GRID_GEOMETRY_CACHE: dict[tuple[int, ...], GridGeometry | None] = {}
+
+
+def _grid_plot_geometry(
+    *,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    x_lines: int,
+    y_lines: int,
+) -> GridGeometry | None:
+    """Reproduce the upstream figure layout and return the plot area in image pixels.
+
+    Returns ``(left, top, width, height)`` measured from the top-left corner of the grid
+    image, or ``None`` when the layout cannot be reproduced confidently.
+    """
+    key = (round(x_min), round(x_max), round(y_min), round(y_max), x_lines, y_lines)
+    if key in _GRID_GEOMETRY_CACHE:
+        return _GRID_GEOMETRY_CACHE[key]
+
+    geometry: GridGeometry | None = None
+    try:
+        figure, axis = plt.subplots(figsize=(10, 10))
+        axis.imshow(np.zeros((2, 2, 3), dtype=np.uint8), extent=(x_min, x_max, y_max, y_min))
+        axis.set_xlim(x_min, x_max)
+        axis.set_ylim(y_max, y_min)
+        axis.spines["left"].set_position(("data", x_min))
+        axis.spines["bottom"].set_position(("data", y_max))
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        x_ticks = np.linspace(x_min, x_max, x_lines)
+        y_ticks = np.linspace(y_min, y_max, y_lines)
+        axis.set_xticks(x_ticks)
+        axis.set_yticks(y_ticks)
+        axis.tick_params(axis="both", which="major", labelsize=10)
+        axis.set_xticklabels([str(round(tick)) for tick in x_ticks])
+        axis.set_yticklabels([str(round(tick)) for tick in y_ticks])
+        axis.set_xlabel("X Coordinate")
+        axis.set_ylabel("Y Coordinate")
+        axis.set_title("Image with Coordinate Grid")
+        plt.tight_layout()
+        figure.canvas.draw()
+        canvas_width, canvas_height = figure.canvas.get_width_height()
+        box = axis.get_window_extent()
+        plt.close(figure)
+
+        left = float(box.x0)
+        top = float(canvas_height - box.y1)
+        plot_width = float(box.width)
+        plot_height = float(box.height)
+        if (
+            0.0 <= left < canvas_width
+            and 0.0 <= top < canvas_height
+            and 0.0 < plot_width <= canvas_width
+            and 0.0 < plot_height <= canvas_height
+            and plot_width >= canvas_width * 0.5
+            and plot_height >= canvas_height * 0.5
+        ):
+            geometry = (left, top, plot_width, plot_height)
+    except Exception as err:
+        logger.warning("Could not reproduce hCaptcha grid geometry: {!r}", err)
+
+    _GRID_GEOMETRY_CACHE[key] = geometry
+    return geometry
+
+
+def _map_model_points_to_page(
+    points: list[Any],
+    *,
+    challenge_bbox: dict[str, float],
+    geometry: GridGeometry | None,
+) -> list[Any]:
+    """Convert model output from grid-image pixels into page coordinates.
+
+    The remap is only adopted when it puts strictly more points inside the challenge area
+    than the raw values did, so genuinely page-space answers are left untouched.
+    """
+    if geometry is None or not points:
+        return points
+
+    bx = float(challenge_bbox["x"])
+    by = float(challenge_bbox["y"])
+    bw = float(challenge_bbox["width"])
+    bh = float(challenge_bbox["height"])
+
+    def _inside(px: float, py: float) -> bool:
+        return bx <= px <= bx + bw and by <= py <= by + bh
+
+    left, top, plot_width, plot_height = geometry
+    remapped = [
+        (
+            bx + (float(point.x) - left) / plot_width * bw,
+            by + (float(point.y) - top) / plot_height * bh,
+        )
+        for point in points
+    ]
+
+    raw_hits = sum(1 for point in points if _inside(float(point.x), float(point.y)))
+    mapped_hits = sum(1 for px, py in remapped if _inside(px, py))
+    if mapped_hits <= raw_hits:
+        return points
+
+    logger.info(
+        "Remapped hCaptcha grid pixels to page coordinates | "
+        "geometry=({:.1f}, {:.1f}, {:.1f}, {:.1f}) | raw_hits={} mapped_hits={}",
+        left,
+        top,
+        plot_width,
+        plot_height,
+        raw_hits,
+        mapped_hits,
+    )
+    for point, (px, py) in zip(points, remapped):
+        point.x = px
+        point.y = py
+    return points
 
 
 def _longest_contiguous_run(values: np.ndarray) -> list[int]:
@@ -202,7 +338,7 @@ def _build_point_prompt(
         )
     else:
         return user_prompt
-    return f"{user_prompt}\n\n{constraint}"
+    return f"{user_prompt}\n\n{constraint}\n\n{_GRID_TICK_INSTRUCTION}"
 
 
 def _is_count_selection_question(question: str) -> bool:
@@ -908,9 +1044,10 @@ def apply_hcaptcha_drag_patch() -> None:
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
-                # Clamp coordinates to challenge view bounds:
-                # Gemini outputs page coordinates directly matching the visual coordinate grid axes.
-                # Strictly clamp points within challenge bounds with safety inset padding.
+                # The model answers in grid-image pixels, so convert them back into page
+                # coordinates first, then only guard against residual out-of-bounds values.
+                # Points are never dropped: dropping one makes the crumb short of the
+                # required selection count and guarantees a failed challenge.
                 if challenge_bbox is not None and getattr(response, "points", None):
                     bx = float(challenge_bbox["x"])
                     by = float(challenge_bbox["y"])
@@ -919,53 +1056,37 @@ def apply_hcaptcha_drag_patch() -> None:
                     x_min, y_min = bx, by
                     x_max, y_max = bx + bw, by + bh
 
-                    # Target bounding box with inset padding:
-                    target_xmin = x_min + 15.0
-                    target_xmax = x_max - 15.0
-                    target_ymin = y_min + 15.0
-                    target_ymax = y_max - 15.0
+                    response.points = _map_model_points_to_page(
+                        response.points,
+                        challenge_bbox=challenge_bbox,
+                        geometry=_grid_plot_geometry(
+                            x_min=x_min,
+                            x_max=x_max,
+                            y_min=y_min,
+                            y_max=y_max,
+                            x_lines=self.config.coordinate_grid.x_line_space_num,
+                            y_lines=self.config.coordinate_grid.y_line_space_num,
+                        ),
+                    )
 
                     valid_points = []
                     for pt in response.points:
-                        orig_x = float(pt.x)
-                        orig_y = float(pt.y)
-                        px = orig_x
-                        py = orig_y
-
-                        # Translate relative coordinates if the model output them from origin 0..bw, 0..bh
-                        # Only translate if px is strictly less than x_min - 30 (e.g. 233 when x_min=390)
-                        if (0 <= px <= bw) and (px < x_min - 30):
-                            px += bx
-                        if (0 <= py <= bh) and (py < y_min - 30):
-                            py += by
-
-                        if px != orig_x or py != orig_y:
+                        px = float(pt.x)
+                        py = float(pt.y)
+                        clamped_x = max(x_min + 4.0, min(x_max - 4.0, px))
+                        clamped_y = max(y_min + 4.0, min(y_max - 4.0, py))
+                        if clamped_x != px or clamped_y != py:
                             logger.info(
-                                "Translated relative coordinate ({:.1f}, {:.1f}) -> page coordinate ({:.1f}, {:.1f})",
-                                orig_x, orig_y, px, py
+                                "Clamped point ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}) to challenge edge",
+                                px,
+                                py,
+                                clamped_x,
+                                clamped_y,
                             )
-
-                        # Check whether coordinates are within a reasonable margin of the challenge bounding box
-                        margin = 120.0
-                        if (x_min - margin <= px <= x_max + margin) and (y_min - margin <= py <= y_max + margin):
-                            clamped_x = max(target_xmin, min(target_xmax, px))
-                            clamped_y = max(target_ymin, min(target_ymax, py))
-                            if clamped_x != px or clamped_y != py:
-                                logger.info(
-                                    "Clamped point ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}) to remain within challenge bounds",
-                                    px, py, clamped_x, clamped_y
-                                )
-                            pt.x = clamped_x
-                            pt.y = clamped_y
-                            valid_points.append(pt)
-                        else:
-                            logger.warning(
-                                "Dropping point wildly outside challenge bounds: ({:.1f}, {:.1f}) vs [{}, {}]",
-                                px, py, (x_min, y_min), (x_max, y_max)
-                            )
-
-                    if valid_points:
-                        response.points = valid_points
+                        pt.x = clamped_x
+                        pt.y = clamped_y
+                        valid_points.append(pt)
+                    response.points = valid_points
 
                 # Only reject if no points could be extracted or clamped
                 if not getattr(response, "points", None):

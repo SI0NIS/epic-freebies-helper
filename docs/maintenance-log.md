@@ -1414,3 +1414,24 @@
   - 限流仍先发送包含失败原因的摘要，再返回 `rate_limited` 正常结束；不会把限流记为领取成功，其他领取异常仍保持失败。未改动登录、hCaptcha、浏览器或 checkout 业务逻辑，保留 `master` 的 `70354be` 浏览器修复。
   - 对最新 PR 代码完成静态复审，并核对 WXPush 上游 `/wxsend` 响应协议；Ruff、Black、Python 语法、工作流 YAML 和 `git diff --check` 检查通过。
   - 按仓库规则，本轮未执行测试或真实微信投递。新增文件包含 29 个测试定义，但仍缺少发送异常、双渠道调度及限流返回值的集成回归覆盖；不能将此前浏览器修复的 70 项测试结果视为本 PR 的验证结果。
+
+### 2026-09-23 修复点选题坐标错位导致的登录 hCaptcha 全量失败
+
+- 现象：
+  - Actions run `35711243798` / job `106692098833`（提交 `7b0adc0`）运行约 21 分 41 秒后失败，两个账号均以 `Authentication failed, aborting this run` 退出，最终 `RuntimeError: 2 of 2 account(s) failed`，`Process completed with exit code 1`。
+  - `runtime.log` 中 `Start Challenge` 43 次，`signal=failure` 94 次而 `signal=success` 仅 3 次；`Dropping point wildly outside challenge bounds` 35 次、`Clamped point` 33 次。
+  - 被丢弃或被强拉到边缘的点最大偏移超过 100px，例如 `(323.0, 395.0) -> (405.0, 395.0)`；登录页最终返回 `Incorrect response. Please refresh the page.`。
+- 根因判断：
+  - 上游 `hcaptcha-challenger==0.19.0` 的 `create_coordinate_grid()` 把 challenge 截图渲染成 `figsize=(10,10)` 的 matplotlib 图，坐标轴刻度标注的是页面坐标，期望模型读刻度后回答；`SpatialReasoner._invoke_spatial()` 会同时把原图与网格图喂给模型。
+  - 本次使用的 `glm-4.6v` 实际输出的是该网格图自身的像素坐标。将 `runtime.log` 中 96 组坐标汇总，x∈[169, 848]、y∈[336, 794]，恰好全部落在 1000×1000 画布的绘图区内；若按页面坐标解释则约 36% 越界。
+  - `patched_challenge_image_label_select()` 把模型输出直接当页面坐标使用，缺少像素到页面坐标的换算。同文件的 `_map_image_bounds_to_page()` 与 `_map_canvas_points_to_page()` 都做了这层换算，此处是遗漏。
+  - 越界点被丢弃后该 crumb 的选中数量不足，被 clamp 的点则落到错误图块，两者都直接导致挑战判定失败；`isloggedin=false` 与 `Incorrect response` 只是下游结果，放宽登录态断言无法解决。
+- 改动文件：
+  - `app/extensions/hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 新增 `_grid_plot_geometry()`，按上游同一套参数复现 matplotlib 图形布局，取得绘图区在网格图中的像素边界，带缓存与合理性自检，复现失败时返回 `None` 并保持原行为。
+  - 新增 `_map_model_points_to_page()`，把模型输出从网格图像素换算为页面坐标；仅当换算后落在挑战区域内的点数严格多于原始值时才采纳，避免把本就正确的页面坐标二次换算成错误位置。
+  - `patched_challenge_image_label_select()` 改为先换算再做边界保护，并且不再丢弃任何点，越界点统一收敛到挑战区域边缘内侧 4px；同时移除 `49f1e86` 引入的 `px < x_min - 30` 相对坐标平移（该条件在挑战区靠页面左上时恒为假，且方向与真实坐标系不符）。
+  - `_build_point_prompt()` 追加明确要求：坐标必须读取网格图的轴刻度（即页面坐标），不得输出渲染图的像素位置。
+  - 静态检查：Python 语法编译与 AST 解析通过；按仓库规则未执行测试。本修复尚未经 GitHub Actions 验证，判定依据是重跑后日志中应出现 `Remapped hCaptcha grid pixels to page coordinates ... raw_hits= mapped_hits=`（后者明显大于前者），同时 `Dropping point wildly outside challenge bounds` 基本消失。
