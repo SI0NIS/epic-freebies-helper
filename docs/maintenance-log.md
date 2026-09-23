@@ -1457,3 +1457,19 @@
   - `patched_challenge_image_drag_drop()` 同步处理模型给出的拖拽路径：`end_point` 补页面偏移；`start_point` 仅在未被 payload 坐标覆盖时补偏移，避免对已经是页面坐标的起点二次偏移。
   - `_build_point_prompt()` 的约束改为描述图内相对坐标范围（`x=0..w, y=0..h`）；`_GRID_TICK_INSTRUCTION` 与拖拽提示词中的起点坐标同步改为图内相对坐标，保持全链路一致。
   - 静态检查：Python 语法编译与 AST 解析通过，改动未引入新的超长行；按仓库规则未执行测试。本修复尚未经 GitHub Actions 验证，判定依据是新日志中应出现 `hCaptcha grid uses in-image axis | page-bbox=... | axis=0..W x 0..H`，点选题不再打印 `Remapped ...`，且 `signal=success` 占比应上升。
+
+### 2026-09-24 点选题坐标系根治：单图原生坐标网格
+
+- 现象：
+  - Actions run `35892442768`（提交 `b9ada157`）失败：`signal=failure` 74 次、`challenge_execution_timeout` 11 次、`signal=success` **0 次**，比 `ca0c6cb`（3/N）更差。
+  - 该 run 中 `Clamped in-image point` 触发 88 次；全量 148 个模型输出点 x∈[36, 857]、y∈[193, 805]，**100% 落在 0..1000**，仅 40.5% 落在图内坐标 0..500 x 0..470。
+- 根因（本轮最终结论）：
+  - 上游 `_invoke_spatial` 同时发送两张图：500x470 的挑战原图 + 1000x1000 的网格图，二者像素空间不同。模型时而按网格图像素回答（run #7、#10），时而按轴刻度页面坐标回答（run #9），**任何单向换算都只能救一半**，这解释了成功率长期停在 3/N 且不随修正方向变化。
+  - 另核查 run #10 的 artifact 拼图确认：当前 hCaptcha 题型已多为动态场景题（"点击球从未碰到的动物"、"点击被线部分遮挡的三个角色"），并非 3x3 图块网格，基于图块的吸附/分类方案不适用。
+- 处理结果：
+  - 新增 `_render_native_coordinate_grid()`：用 OpenCV 把坐标网格与刻度直接画在**原分辨率**挑战截图上，刻度值 = 截图自身像素坐标（0,0)-(w,h)，四边标注、黑描边白字、38% 透明度细线。
+  - `_apply_native_grid_patch()` 取代原 `_apply_relative_axis_patch()`：`RoboticArm._capture_spatial_mapping` 仍截图并返回 (challenge_view, 叠加图)，但叠加图为原生网格；渲染失败时回退上游 `create_coordinate_grid` 双图方案。
+  - 覆盖 `SpatialReasoner._invoke_spatial`：**只发送叠加网格后的这一张图**。网格图本身包含完整挑战内容，模型看到的唯一图像就是"刻度=像素坐标"的图，"读刻度"与"估像素"两种行为收敛为同一答案，坐标系歧义从物理上消除。
+  - 消费侧沿用 `b9ada157` 的确定性偏移：点选题 `bx + pt.x` / `by + pt.y` 后边界钳制、不丢弃；拖拽路径补挑战区偏移逻辑不变。
+  - 工作流 `AUTH_MAX_ATTEMPTS` 默认值 2 -> 3：单次认证尝试成功率偏低时，增加账号内的重试机会以提升整次 run 的成功概率（job 超时仍为 60 分钟，实测 2 次尝试约 32 分钟，3 次约 45 分钟，仍在预算内）。
+  - 静态检查：py_compile 与 AST 解析通过；网格渲染已在本地用 run #7/#9 的 5 张真实挑战截图验证（输出见内部工具截图），刻度四边可读、场景内容清晰。本修复尚未经 GitHub Actions 验证，判定依据是新日志应出现 `hCaptcha native coordinate grid ... mode=native`，且不再出现 `hCaptcha grid uses in-image axis`；模型输出应集中在 0..500 x 0..470（越界钳制次数应显著下降），`signal=success` 占比应上升。

@@ -22,6 +22,7 @@ from hcaptcha_challenger.models import (
     RequestType,
     SpatialPath,
 )
+from hcaptcha_challenger.tools.spatial.base import SpatialReasoner
 from loguru import logger
 from playwright.async_api import Locator, TimeoutError as PlaywrightTimeoutError
 
@@ -31,23 +32,79 @@ from extensions.numbered_line_solver import solve_numbered_line_drag
 _EMPTY_CHECKCAPTCHA_GRACE_SECONDS = 5.0
 
 _GRID_TICK_INSTRUCTION = (
-    "The coordinate-grid image is labelled with in-image coordinates whose origin (0, 0) is the "
-    "top-left corner of the challenge image. Read each value from the axis tick labels and report "
-    "the point in that same in-image coordinate system."
+    "The image contains a thin coordinate grid overlay. Its axis ticks label the image's own "
+    "pixel coordinates, with origin (0, 0) at the top-left corner of the image and maxima at "
+    "the bottom-right corner. Report every point as [x, y] in exactly these coordinates."
 )
 
 
-# 上游 create_coordinate_grid() 用「页面 bbox」当坐标轴刻度，期望模型读刻度后回答页面坐标。
-# 但模型看不到页面，只看得见那张网格图，实测它输出的坐标系时对时错（对比 run #35711243798 与
-# run #35806720032 的 artifact 可以直接看到）。这里把轴刻度改成「挑战图内相对坐标」
-# (0,0)-(width,height)，模型只需描述它在图里看到的位置，消费侧补上挑战区偏移即可，
-# 映射从"猜测"退化成确定的加法。
-def _apply_relative_axis_patch() -> None:
-    """把坐标网格的轴刻度从页面坐标改成挑战图内相对坐标。"""
-    if getattr(RoboticArm._capture_spatial_mapping, "_epic_relative_axis_patch", False):
+def _label_with_outline(image: np.ndarray, text: str, org: tuple[int, int]) -> None:
+    """黑描边 + 白字，保证在任何背景上可读。"""
+    cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(image, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _render_native_coordinate_grid(
+    screenshot: Path,
+    output: Path,
+    *,
+    x_lines: int,
+    y_lines: int,
+) -> bool:
+    """把坐标网格直接画在挑战截图上，刻度值 = 截图自身的像素坐标。
+
+    这样「读刻度」和「估计像素位置」给出同一个答案，模型不再有第二种坐标系可选，
+    上游双图（500x470 原图 + 1000x1000 网格图）造成的坐标歧义从物理上消失。
+    """
+    try:
+        image = cv2.imread(str(screenshot))
+        if image is None:
+            return False
+        height, width = image.shape[:2]
+        if width <= 0 or height <= 0:
+            return False
+        x_ticks = np.linspace(0.0, float(width), max(3, int(x_lines)))
+        y_ticks = np.linspace(0.0, float(height), max(3, int(y_lines)))
+
+        lines = image.copy()
+        line_color = (110, 190, 255)
+        for tick in x_ticks:
+            cv2.line(lines, (int(round(tick)), 0), (int(round(tick)), height - 1), line_color, 1)
+        for tick in y_ticks:
+            cv2.line(lines, (0, int(round(tick))), (width - 1, int(round(tick))), line_color, 1)
+        blended = cv2.addWeighted(lines, 0.38, image, 0.62, 0.0)
+
+        for tick in x_ticks:
+            text = str(int(round(tick)))
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+            x = min(max(int(round(tick)) - tw // 2, 1), width - tw - 1)
+            _label_with_outline(blended, text, (x, height - 6))
+            _label_with_outline(blended, text, (x, 14))
+        for tick in y_ticks:
+            text = str(int(round(tick)))
+            y = min(max(int(round(tick)) + 4, 14), height - 6)
+            _label_with_outline(blended, text, (2, y))
+            _label_with_outline(blended, text, (width - 34, y))
+
+        ok, encoded = cv2.imencode(".png", blended)
+        if not ok:
+            return False
+        output.write_bytes(encoded.tobytes())
+        return True
+    except Exception as err:
+        logger.warning("Could not render native hCaptcha grid: {!r}", err)
+        return False
+
+
+# 上游把「500x470 原图」和「1000x1000 网格图」一起发给模型，两者像素空间不同，
+# 模型时而按原图像素回答、时而按网格图像素回答（run #7/#9/#10 的 artifact 逐一验证过），
+# 任何单向换算都只能救一半。这里改成：网格直接画在原分辨率截图上、刻度=像素坐标，
+# 且只把这一张图发给模型 —— 歧义从物理上消失，消费侧只需加挑战区偏移。
+def _apply_native_grid_patch() -> None:
+    if getattr(RoboticArm._capture_spatial_mapping, "_epic_native_grid_patch", False):
         return
 
-    async def capture_spatial_mapping_with_relative_axis(
+    async def capture_spatial_mapping_with_native_grid(
         self: RoboticArm, frame_challenge: Any, cache_key: Path, crumb_id: int | str
     ):
         challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
@@ -60,40 +117,62 @@ def _apply_relative_axis_patch() -> None:
             logger.warning("hCaptcha challenge view has no bounding box; offsets default to zero")
             page_bbox = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
 
-        # 与上游唯一的不同：轴刻度用 0..width / 0..height，而不是页面坐标
-        relative_bbox = {
-            "x": 0.0,
-            "y": 0.0,
-            "width": float(page_bbox["width"]),
-            "height": float(page_bbox["height"]),
-        }
-        grid = create_coordinate_grid(
-            challenge_screenshot,
-            relative_bbox,
-            x_line_space_num=self.config.coordinate_grid.x_line_space_num,
-            y_line_space_num=self.config.coordinate_grid.y_line_space_num,
-            color=self.config.coordinate_grid.color,
-            adaptive_contrast=self.config.coordinate_grid.adaptive_contrast,
-        )
-
         grid_divisions = cache_key.joinpath(f"{cache_key.name}_{crumb_id}_spatial_helper.png")
         grid_divisions.parent.mkdir(parents=True, exist_ok=True)
-        plt.imsave(str(grid_divisions.resolve()), grid)
+        rendered = _render_native_coordinate_grid(
+            challenge_screenshot,
+            grid_divisions,
+            x_lines=self.config.coordinate_grid.x_line_space_num or 11,
+            y_lines=self.config.coordinate_grid.y_line_space_num or 20,
+        )
+        if not rendered:
+            # 渲染失败时退回上游双图方案，至少不比上游差
+            grid = create_coordinate_grid(
+                challenge_screenshot,
+                page_bbox,
+                x_line_space_num=self.config.coordinate_grid.x_line_space_num,
+                y_line_space_num=self.config.coordinate_grid.y_line_space_num,
+                color=self.config.coordinate_grid.color,
+                adaptive_contrast=self.config.coordinate_grid.adaptive_contrast,
+            )
+            plt.imsave(str(grid_divisions.resolve()), grid)
 
         logger.info(
-            "hCaptcha grid uses in-image axis | page_bbox=({:.0f}, {:.0f}, {:.0f}, {:.0f}) "
-            "| axis=0..{:.0f} x 0..{:.0f}",
+            "hCaptcha native coordinate grid | page_bbox=({:.0f}, {:.0f}, {:.0f}, {:.0f}) | mode={}",
             page_bbox["x"],
             page_bbox["y"],
             page_bbox["width"],
             page_bbox["height"],
-            relative_bbox["width"],
-            relative_bbox["height"],
+            "native" if rendered else "upstream-fallback",
         )
         return challenge_screenshot, grid_divisions
 
-    capture_spatial_mapping_with_relative_axis._epic_relative_axis_patch = True
-    RoboticArm._capture_spatial_mapping = capture_spatial_mapping_with_relative_axis
+    capture_spatial_mapping_with_native_grid._epic_native_grid_patch = True
+    RoboticArm._capture_spatial_mapping = capture_spatial_mapping_with_native_grid
+
+    if getattr(SpatialReasoner._invoke_spatial, "_epic_single_image_patch", False):
+        return
+
+    async def invoke_spatial_with_single_image(
+        self,
+        *,
+        challenge_screenshot: Path,
+        grid_divisions: Path,
+        auxiliary_information: str | None = None,
+        response_schema: Any,
+        **kwargs,
+    ):
+        # 只发带网格叠加的挑战图：网格图本身就包含完整挑战内容
+        return await self._provider.generate_with_images(
+            images=[Path(grid_divisions)],
+            user_prompt=auxiliary_information,
+            description=self.description,
+            response_schema=response_schema,
+            **kwargs,
+        )
+
+    invoke_spatial_with_single_image._epic_single_image_patch = True
+    SpatialReasoner._invoke_spatial = invoke_spatial_with_single_image
 
 
 def _longest_contiguous_run(values: np.ndarray) -> list[int]:
@@ -934,7 +1013,7 @@ def _patch_robotic_arm_safety() -> None:
 
 def apply_hcaptcha_drag_patch() -> None:
     _apply_empty_checkcaptcha_patch()
-    _apply_relative_axis_patch()
+    _apply_native_grid_patch()
     _patch_robotic_arm_safety()
 
     if not getattr(RoboticArm.challenge_image_label_select, "_epic_point_bounds_patch", False):
