@@ -14,6 +14,7 @@ from hcaptcha_challenger.agent.challenger import AgentV, RoboticArm
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402  (must follow matplotlib.use)
 
+from hcaptcha_challenger.helper import create_coordinate_grid
 from hcaptcha_challenger.models import (
     CaptchaResponse,
     ChallengeTypeEnum,
@@ -30,135 +31,69 @@ from extensions.numbered_line_solver import solve_numbered_line_drag
 _EMPTY_CHECKCAPTCHA_GRACE_SECONDS = 5.0
 
 _GRID_TICK_INSTRUCTION = (
-    "Read every coordinate from the axis tick labels of the coordinate-grid image directly "
-    "(those ticks are labelled with page coordinates). Do not report raw pixel positions of "
-    "the rendered image."
+    "The coordinate-grid image is labelled with in-image coordinates whose origin (0, 0) is the "
+    "top-left corner of the challenge image. Read each value from the axis tick labels and report "
+    "the point in that same in-image coordinate system."
 )
 
-# The upstream `create_coordinate_grid` helper renders the challenge screenshot into a
-# matplotlib figure (figsize 10x10 => 1000x1000 px) whose axis ticks are labelled with
-# *page* coordinates, expecting the model to read those ticks. GLM returns the pixel
-# coordinates of that rendered figure instead, so the plot area layout is reproduced once
-# here in order to convert model output back into page coordinates.
-GridGeometry = tuple[float, float, float, float]
 
-_GRID_GEOMETRY_CACHE: dict[tuple[int, ...], GridGeometry | None] = {}
+# 上游 create_coordinate_grid() 用「页面 bbox」当坐标轴刻度，期望模型读刻度后回答页面坐标。
+# 但模型看不到页面，只看得见那张网格图，实测它输出的坐标系时对时错（对比 run #35711243798 与
+# run #35806720032 的 artifact 可以直接看到）。这里把轴刻度改成「挑战图内相对坐标」
+# (0,0)-(width,height)，模型只需描述它在图里看到的位置，消费侧补上挑战区偏移即可，
+# 映射从"猜测"退化成确定的加法。
+def _apply_relative_axis_patch() -> None:
+    """把坐标网格的轴刻度从页面坐标改成挑战图内相对坐标。"""
+    if getattr(RoboticArm._capture_spatial_mapping, "_epic_relative_axis_patch", False):
+        return
 
+    async def capture_spatial_mapping_with_relative_axis(
+        self: RoboticArm, frame_challenge: Any, cache_key: Path, crumb_id: int | str
+    ):
+        challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
+        challenge_screenshot = cache_key.joinpath(f"{cache_key.name}_{crumb_id}_challenge_view.png")
+        challenge_screenshot.parent.mkdir(parents=True, exist_ok=True)
+        await challenge_view.screenshot(type="png", path=challenge_screenshot)
 
-def _grid_plot_geometry(
-    *,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-    x_lines: int,
-    y_lines: int,
-) -> GridGeometry | None:
-    """Reproduce the upstream figure layout and return the plot area in image pixels.
+        page_bbox = await challenge_view.bounding_box()
+        if not page_bbox:
+            logger.warning("hCaptcha challenge view has no bounding box; offsets default to zero")
+            page_bbox = {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}
 
-    Returns ``(left, top, width, height)`` measured from the top-left corner of the grid
-    image, or ``None`` when the layout cannot be reproduced confidently.
-    """
-    key = (round(x_min), round(x_max), round(y_min), round(y_max), x_lines, y_lines)
-    if key in _GRID_GEOMETRY_CACHE:
-        return _GRID_GEOMETRY_CACHE[key]
-
-    geometry: GridGeometry | None = None
-    try:
-        figure, axis = plt.subplots(figsize=(10, 10))
-        axis.imshow(np.zeros((2, 2, 3), dtype=np.uint8), extent=(x_min, x_max, y_max, y_min))
-        axis.set_xlim(x_min, x_max)
-        axis.set_ylim(y_max, y_min)
-        axis.spines["left"].set_position(("data", x_min))
-        axis.spines["bottom"].set_position(("data", y_max))
-        axis.spines["top"].set_visible(False)
-        axis.spines["right"].set_visible(False)
-        x_ticks = np.linspace(x_min, x_max, x_lines)
-        y_ticks = np.linspace(y_min, y_max, y_lines)
-        axis.set_xticks(x_ticks)
-        axis.set_yticks(y_ticks)
-        axis.tick_params(axis="both", which="major", labelsize=10)
-        axis.set_xticklabels([str(round(tick)) for tick in x_ticks])
-        axis.set_yticklabels([str(round(tick)) for tick in y_ticks])
-        axis.set_xlabel("X Coordinate")
-        axis.set_ylabel("Y Coordinate")
-        axis.set_title("Image with Coordinate Grid")
-        plt.tight_layout()
-        figure.canvas.draw()
-        canvas_width, canvas_height = figure.canvas.get_width_height()
-        box = axis.get_window_extent()
-        plt.close(figure)
-
-        left = float(box.x0)
-        top = float(canvas_height - box.y1)
-        plot_width = float(box.width)
-        plot_height = float(box.height)
-        if (
-            0.0 <= left < canvas_width
-            and 0.0 <= top < canvas_height
-            and 0.0 < plot_width <= canvas_width
-            and 0.0 < plot_height <= canvas_height
-            and plot_width >= canvas_width * 0.5
-            and plot_height >= canvas_height * 0.5
-        ):
-            geometry = (left, top, plot_width, plot_height)
-    except Exception as err:
-        logger.warning("Could not reproduce hCaptcha grid geometry: {!r}", err)
-
-    _GRID_GEOMETRY_CACHE[key] = geometry
-    return geometry
-
-
-def _map_model_points_to_page(
-    points: list[Any],
-    *,
-    challenge_bbox: dict[str, float],
-    geometry: GridGeometry | None,
-) -> list[Any]:
-    """Convert model output from grid-image pixels into page coordinates.
-
-    The remap is only adopted when it puts strictly more points inside the challenge area
-    than the raw values did, so genuinely page-space answers are left untouched.
-    """
-    if geometry is None or not points:
-        return points
-
-    bx = float(challenge_bbox["x"])
-    by = float(challenge_bbox["y"])
-    bw = float(challenge_bbox["width"])
-    bh = float(challenge_bbox["height"])
-
-    def _inside(px: float, py: float) -> bool:
-        return bx <= px <= bx + bw and by <= py <= by + bh
-
-    left, top, plot_width, plot_height = geometry
-    remapped = [
-        (
-            bx + (float(point.x) - left) / plot_width * bw,
-            by + (float(point.y) - top) / plot_height * bh,
+        # 与上游唯一的不同：轴刻度用 0..width / 0..height，而不是页面坐标
+        relative_bbox = {
+            "x": 0.0,
+            "y": 0.0,
+            "width": float(page_bbox["width"]),
+            "height": float(page_bbox["height"]),
+        }
+        grid = create_coordinate_grid(
+            challenge_screenshot,
+            relative_bbox,
+            x_line_space_num=self.config.coordinate_grid.x_line_space_num,
+            y_line_space_num=self.config.coordinate_grid.y_line_space_num,
+            color=self.config.coordinate_grid.color,
+            adaptive_contrast=self.config.coordinate_grid.adaptive_contrast,
         )
-        for point in points
-    ]
 
-    raw_hits = sum(1 for point in points if _inside(float(point.x), float(point.y)))
-    mapped_hits = sum(1 for px, py in remapped if _inside(px, py))
-    if mapped_hits <= raw_hits:
-        return points
+        grid_divisions = cache_key.joinpath(f"{cache_key.name}_{crumb_id}_spatial_helper.png")
+        grid_divisions.parent.mkdir(parents=True, exist_ok=True)
+        plt.imsave(str(grid_divisions.resolve()), grid)
 
-    logger.info(
-        "Remapped hCaptcha grid pixels to page coordinates | "
-        "geometry=({:.1f}, {:.1f}, {:.1f}, {:.1f}) | raw_hits={} mapped_hits={}",
-        left,
-        top,
-        plot_width,
-        plot_height,
-        raw_hits,
-        mapped_hits,
-    )
-    for point, (px, py) in zip(points, remapped):
-        point.x = px
-        point.y = py
-    return points
+        logger.info(
+            "hCaptcha grid uses in-image axis | page_bbox=({:.0f}, {:.0f}, {:.0f}, {:.0f}) "
+            "| axis=0..{:.0f} x 0..{:.0f}",
+            page_bbox["x"],
+            page_bbox["y"],
+            page_bbox["width"],
+            page_bbox["height"],
+            relative_bbox["width"],
+            relative_bbox["height"],
+        )
+        return challenge_screenshot, grid_divisions
+
+    capture_spatial_mapping_with_relative_axis._epic_relative_axis_patch = True
+    RoboticArm._capture_spatial_mapping = capture_spatial_mapping_with_relative_axis
 
 
 def _longest_contiguous_run(values: np.ndarray) -> list[int]:
@@ -319,25 +254,29 @@ def _build_point_prompt(
     challenge_bbox: dict[str, float] | None,
     clickable_bounds: tuple[float, float, float, float] | None,
 ) -> str:
+    if challenge_bbox is None:
+        return user_prompt
+
+    origin_x = float(challenge_bbox["x"])
+    origin_y = float(challenge_bbox["y"])
+    width = float(challenge_bbox["width"])
+    height = float(challenge_bbox["height"])
+
     if clickable_bounds is not None:
         x_min, y_min, x_max, y_max = clickable_bounds
+        # clickable_bounds 来自图像检测，是页面坐标；换算成网格图使用的图内相对坐标
         constraint = (
-            "The clickable tile grid is within page coordinates "
-            f"x={x_min:.0f}..{x_max:.0f}, y={y_min:.0f}..{y_max:.0f}. "
+            "The clickable tile grid is within in-image coordinates "
+            f"x={x_min - origin_x:.0f}..{x_max - origin_x:.0f}, "
+            f"y={y_min - origin_y:.0f}..{y_max - origin_y:.0f}. "
             "Every returned point must be inside this grid. Repeated count badges and example "
             "animals outside the grid are references only, regardless of which side they occupy."
         )
-    elif challenge_bbox is not None:
-        x_min = float(challenge_bbox["x"])
-        y_min = float(challenge_bbox["y"])
-        x_max = x_min + float(challenge_bbox["width"])
-        y_max = y_min + float(challenge_bbox["height"])
-        constraint = (
-            "Every returned point must be inside the visible challenge bounds "
-            f"x={x_min:.0f}..{x_max:.0f}, y={y_min:.0f}..{y_max:.0f}."
-        )
     else:
-        return user_prompt
+        constraint = (
+            "Every returned point must be inside the challenge image, "
+            f"x=0..{width:.0f}, y=0..{height:.0f} (in-image coordinates)."
+        )
     return f"{user_prompt}\n\n{constraint}\n\n{_GRID_TICK_INSTRUCTION}"
 
 
@@ -995,6 +934,7 @@ def _patch_robotic_arm_safety() -> None:
 
 def apply_hcaptcha_drag_patch() -> None:
     _apply_empty_checkcaptcha_patch()
+    _apply_relative_axis_patch()
     _patch_robotic_arm_safety()
 
     if not getattr(RoboticArm.challenge_image_label_select, "_epic_point_bounds_patch", False):
@@ -1044,10 +984,9 @@ def apply_hcaptcha_drag_patch() -> None:
                 )
                 logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
 
-                # The model answers in grid-image pixels, so convert them back into page
-                # coordinates first, then only guard against residual out-of-bounds values.
-                # Points are never dropped: dropping one makes the crumb short of the
-                # required selection count and guarantees a failed challenge.
+                # 网格图的轴刻度现在是挑战图内相对坐标 (0..w, 0..h)，
+                # 补上挑战区在页面中的偏移即可。点仍然不丢弃：少一个点会让该 crumb
+                # 达不到要求的选择数量，必然判失败。
                 if challenge_bbox is not None and getattr(response, "points", None):
                     bx = float(challenge_bbox["x"])
                     by = float(challenge_bbox["y"])
@@ -1056,30 +995,17 @@ def apply_hcaptcha_drag_patch() -> None:
                     x_min, y_min = bx, by
                     x_max, y_max = bx + bw, by + bh
 
-                    response.points = _map_model_points_to_page(
-                        response.points,
-                        challenge_bbox=challenge_bbox,
-                        geometry=_grid_plot_geometry(
-                            x_min=x_min,
-                            x_max=x_max,
-                            y_min=y_min,
-                            y_max=y_max,
-                            x_lines=self.config.coordinate_grid.x_line_space_num,
-                            y_lines=self.config.coordinate_grid.y_line_space_num,
-                        ),
-                    )
-
                     valid_points = []
                     for pt in response.points:
-                        px = float(pt.x)
-                        py = float(pt.y)
-                        clamped_x = max(x_min + 4.0, min(x_max - 4.0, px))
-                        clamped_y = max(y_min + 4.0, min(y_max - 4.0, py))
-                        if clamped_x != px or clamped_y != py:
+                        raw_x = bx + float(pt.x)
+                        raw_y = by + float(pt.y)
+                        clamped_x = max(x_min + 4.0, min(x_max - 4.0, raw_x))
+                        clamped_y = max(y_min + 4.0, min(y_max - 4.0, raw_y))
+                        if (clamped_x, clamped_y) != (raw_x, raw_y):
                             logger.info(
-                                "Clamped point ({:.1f}, {:.1f}) -> ({:.1f}, {:.1f}) to challenge edge",
-                                px,
-                                py,
+                                "Clamped in-image point ({:.1f}, {:.1f}) -> page ({:.1f}, {:.1f})",
+                                raw_x,
+                                raw_y,
                                 clamped_x,
                                 clamped_y,
                             )
@@ -1150,6 +1076,7 @@ def apply_hcaptcha_drag_patch() -> None:
                     challenge_screenshot=raw,
                     challenge_bbox=challenge_bbox,
                 )
+            model_paths = False
             if paths is None:
                 source_points = _payload_source_points(
                     captcha_payload=self.captcha_payload,
@@ -1157,6 +1084,13 @@ def apply_hcaptcha_drag_patch() -> None:
                     challenge_screenshot=raw,
                     challenge_bbox=challenge_bbox,
                 )
+                if challenge_bbox and source_points:
+                    # 提示词里的拖拽起点也要用图内相对坐标，与网格图轴刻度保持一致
+                    origin_x = float(challenge_bbox["x"])
+                    origin_y = float(challenge_bbox["y"])
+                    source_points = [
+                        (int(x - origin_x), int(y - origin_y)) for x, y in source_points
+                    ]
                 response = await self._spatial_path_reasoner(
                     challenge_screenshot=raw,
                     grid_divisions=projection,
@@ -1174,6 +1108,28 @@ def apply_hcaptcha_drag_patch() -> None:
                     crumb_id=cid,
                     challenge_screenshot=raw,
                     challenge_bbox=challenge_bbox,
+                )
+                model_paths = True
+
+            if model_paths and paths and challenge_bbox:
+                # 网格图轴刻度是挑战图内相对坐标：end_point 必须补上挑战区偏移；
+                # 若 start_point 没有被 payload 坐标覆盖，它也还是相对坐标。
+                dx = float(challenge_bbox["x"])
+                dy = float(challenge_bbox["y"])
+                entity_count = len(_entity_centers(self.captcha_payload, cid))
+                source_replaced = entity_count > 0 and entity_count == len(paths)
+                for path in paths:
+                    path.end_point.x = float(path.end_point.x) + dx
+                    path.end_point.y = float(path.end_point.y) + dy
+                    if not source_replaced:
+                        path.start_point.x = float(path.start_point.x) + dx
+                        path.start_point.y = float(path.start_point.y) + dy
+                logger.info(
+                    "Shifted model drag paths into page space | offset=({:.0f}, {:.0f}) "
+                    "| start_from_payload={}",
+                    dx,
+                    dy,
+                    source_replaced,
                 )
 
             for path in paths:

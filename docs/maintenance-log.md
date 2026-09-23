@@ -1435,3 +1435,25 @@
   - `patched_challenge_image_label_select()` 改为先换算再做边界保护，并且不再丢弃任何点，越界点统一收敛到挑战区域边缘内侧 4px；同时移除 `49f1e86` 引入的 `px < x_min - 30` 相对坐标平移（该条件在挑战区靠页面左上时恒为假，且方向与真实坐标系不符）。
   - `_build_point_prompt()` 追加明确要求：坐标必须读取网格图的轴刻度（即页面坐标），不得输出渲染图的像素位置。
   - 静态检查：Python 语法编译与 AST 解析通过；按仓库规则未执行测试。本修复尚未经 GitHub Actions 验证，判定依据是重跑后日志中应出现 `Remapped hCaptcha grid pixels to page coordinates ... raw_hits= mapped_hits=`（后者明显大于前者），同时 `Dropping point wildly outside challenge bounds` 基本消失。
+
+### 2026-09-23 修正点选题坐标系：网格图轴刻度改用挑战图内相对坐标
+
+- 现象：
+  - Actions run `35806720032`（job `107009120420`，提交 `ca0c6cb`）在 01:33–01:58 UTC 运行约 25 分钟后失败，两个账号均以 `Authentication failed, aborting this run` 退出，最终 `RuntimeError: 2 of 2 account(s) failed`。
+  - 运行期 `signal=failure` 48 次、`signal=success` 3 次、`challenge_execution_timeout` 1 次；题型分布 `image_label_multi_select` 26 / `image_label_single_select` 23 / `image_drag_single` 2。
+  - 该 run 日志中 `generativelanguage` / `googleapis` / `RESOURCE_EXHAUSTED` / `api_key_invalid` / `quota` 出现次数均为 0，job env 里 `GEMINI_API_KEY` 为空、`GLM_API_KEY: ***`、`LLM_PROVIDER=glm` —— 本次失败与 Google / Gemini 无关。
+  - 每次挑战的固定形态：先出现 `hCaptcha check returned an empty response; waiting 5.0s for the paired result | status=200`，0.2~0.5 秒后判 `signal=failure`。对照上游 `agent/challenger.py`，空 body 只是 checkcaptcha「成对请求」的一半（本仓库的 patch 会挂起 5s 再补 `pass=False`），真正决定结果的是配对的另一个响应，即 hCaptcha 判定答案错误。
+- 根因判断：
+  - 上游 `create_coordinate_grid()` 使用「页面 bbox」作为坐标轴刻度，期望模型读刻度后回答页面坐标；但模型看不到页面，只看得见那张网格图。
+  - 把 run `35711243798` 与 `35806720032` 的 artifact 中模型输出点，分别按「页面坐标」和「网格图像素」两种解释绘制到 `challenge_view` 原图上逐一比对，两个 run 给出**相反**的最优解释：run #9 的样本支持页面坐标（其中一个样本 2/2 完美命中目标），run #7 的部分样本支持像素坐标。
+  - 因此模型输出的坐标系在样本之间并不稳定。任何单向修正（`49f1e86` 的相对坐标平移、`ca0c6cb` 引入的像素到页面换算）都只能对一部分情况有效，这解释了成功率长期停在 3/N 且不随修正变化。
+  - 另一个独立瓶颈是模型定位精度：单次挑战命中率约 50%（多数只命中 1/2），而 hCaptcha 要求所选全部正确。
+- 改动文件：
+  - `app/extensions/hcaptcha_adapter.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 新增 `_apply_relative_axis_patch()`，覆盖 `RoboticArm._capture_spatial_mapping()`：仍然由上游渲染网格图，但坐标轴刻度改用「挑战图内相对坐标」`(0,0)-(width,height)`，不再使用页面 bbox。模型只需描述自己在图内看到的位置，坐标系歧义从源头消除。
+  - `patched_challenge_image_label_select()` 移除像素到页面的换算（删除 `_map_model_points_to_page()` 与 `_grid_plot_geometry()`），改为对模型输出补上挑战区在页面中的偏移，并保留「不丢弃、只做边缘钳制」的处理。
+  - `patched_challenge_image_drag_drop()` 同步处理模型给出的拖拽路径：`end_point` 补页面偏移；`start_point` 仅在未被 payload 坐标覆盖时补偏移，避免对已经是页面坐标的起点二次偏移。
+  - `_build_point_prompt()` 的约束改为描述图内相对坐标范围（`x=0..w, y=0..h`）；`_GRID_TICK_INSTRUCTION` 与拖拽提示词中的起点坐标同步改为图内相对坐标，保持全链路一致。
+  - 静态检查：Python 语法编译与 AST 解析通过，改动未引入新的超长行；按仓库规则未执行测试。本修复尚未经 GitHub Actions 验证，判定依据是新日志中应出现 `hCaptcha grid uses in-image axis | page-bbox=... | axis=0..W x 0..H`，点选题不再打印 `Remapped ...`，且 `signal=success` 占比应上升。
