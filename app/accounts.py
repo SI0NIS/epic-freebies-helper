@@ -128,3 +128,23 @@ def swap_account(email: str, password: str) -> None:
     settings.EPIC_PASSWORD = SecretStr(password)
 
     logger.info("Switched to account: {}", mask_email(email))
+
+
+def swap_account_by_email(email: str) -> None:
+    """Swap to the account identified by email.
+
+    The matching password is resolved internally from EPIC_ACCOUNTS so callers
+    never have to hold the plaintext credential tuple in their own frame. This
+    keeps passwords out of coroutine locals that could otherwise be captured by
+    tracebacks logged via ``logger.catch``.
+    """
+    raw = get_epic_accounts_raw()
+    if not raw:
+        raise RuntimeError("EPIC_ACCOUNTS is not configured")
+
+    for acc_email, acc_password in parse_multi_accounts(raw)[0]:
+        if acc_email == email:
+            swap_account(acc_email, acc_password)
+            return
+
+    raise RuntimeError(f"Account not found in EPIC_ACCOUNTS: {mask_email(email)}")

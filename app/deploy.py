@@ -21,7 +21,13 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 from pytz import timezone
 
-from accounts import get_epic_accounts_raw, mask_email, parse_multi_accounts, swap_account
+from accounts import (
+    get_epic_accounts_raw,
+    mask_email,
+    parse_multi_accounts,
+    swap_account,
+    swap_account_by_email,
+)
 from services.epic_authorization_service import EpicAuthorization
 from services.browser_context import open_browser_context, resolve_headless_mode
 from services.epic_collection_summary_service import collect_epic_games_with_summary
@@ -64,7 +70,7 @@ def _is_free_game_rate_limit_error(err: Exception) -> bool:
     return False
 
 
-@logger.catch(reraise=True)
+@logger.catch(reraise=True, diagnose=False)
 async def execute_browser_tasks(headless: bool | str = True, *, collect_summary: bool = False):
     """
     Execute Epic Games free game collection tasks using browser automation.
@@ -163,23 +169,30 @@ async def execute_browser_tasks_with_notification(
 
 
 async def execute_multiple_accounts(
-    accounts: list[tuple[str, str]], headless: bool | str = True
+    account_emails: list[str], headless: bool | str = True
 ) -> None:
-    """Run collection for an explicitly enabled, fully valid multi-account list."""
-    total = len(accounts)
+    """Run collection for an explicitly enabled, fully valid multi-account list.
+
+    Only account emails (non-sensitive identifiers) are passed in. The matching
+    password is resolved inside ``swap_account_by_email`` so plaintext credentials
+    never enter this coroutine's frame and therefore cannot be captured by
+    tracebacks.
+    """
+    total = len(account_emails)
     succeeded = 0
     rate_limited_accounts: list[str] = []
     failed_accounts: list[str] = []
 
-    for index, (email, password) in enumerate(accounts, 1):
+    for index, email in enumerate(account_emails, 1):
         masked_email = mask_email(email)
         logger.info("=" * 60)
         logger.info("Processing account {}/{}: {}", index, total, masked_email)
         logger.info("=" * 60)
 
         try:
-            # Swap active credentials so user_data_dir and login use this account.
-            swap_account(email, password)
+            # Swap active credentials. The password is resolved internally by
+            # email, so it never becomes a local variable in this coroutine's frame.
+            swap_account_by_email(email)
             outcome = await execute_browser_tasks_with_notification(
                 headless=headless, account_label=masked_email
             )
@@ -258,8 +271,11 @@ async def _run_accounts(headless: bool | str = True) -> None:
         )
 
     # Only explicitly enabled, fully valid multi-account configurations
-    # should enter the aggregation loop.
-    await execute_multiple_accounts(accounts, headless=headless)
+    # should enter the aggregation loop. Pass emails only — credentials are
+    # resolved internally so they never reach a traceback-captured coroutine frame.
+    await execute_multiple_accounts(
+        [email for email, _ in accounts], headless=headless
+    )
 
 
 async def deploy():
@@ -271,9 +287,13 @@ async def deploy():
     """
     headless = resolve_headless_mode()
 
-    # Log current configuration for debugging
+    # Log current configuration for debugging. Secret-bearing fields are redacted
+    # so credentials never land in logs or tracebacks.
     sj = settings.model_dump(mode="json")
     sj["headless"] = headless
+    for name, field in settings.model_fields.items():
+        if "SecretStr" in str(field.annotation) and sj.get(name):
+            sj[name] = "***redacted***"
     logger.debug(
         f"Starting deployment with configuration: {json.dumps(sj, indent=2, ensure_ascii=False)}"
     )
