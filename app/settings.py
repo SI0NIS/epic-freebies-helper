@@ -75,6 +75,15 @@ class EpicSettings(AgentConfig):
     )
     OPENAI_REQUEST_TIMEOUT_SECONDS: float = Field(default=90.0, gt=5.0, le=180.0)
 
+    # Captcha text recognition (OCR) assist, ported from
+    # openai-captcha-detection/src/ocr_any_provider.py.
+    OCR_ENABLED: bool = Field(
+        default=True,
+        description="OCR the captcha image when a challenge type has no dedicated solver",
+    )
+    OCR_TIMEOUT_SECONDS: float = Field(default=60.0, gt=5.0, le=180.0)
+    OCR_MAX_RETRIES: int = Field(default=3, ge=1, le=5)
+
     BROWSER_BACKEND: str = Field(
         default="auto", description="Supported values: auto, camoufox, playwright"
     )

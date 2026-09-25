@@ -993,6 +993,11 @@ def _patch_robotic_arm_safety() -> None:
                         return res
                 case _:
                     logger.warning(f"Unknown types of challenges: {challenge_type}")
+                    # No dedicated solver for this type; recognize any text in the
+                    # captcha image so the blind refresh loop below is at least
+                    # informed, and so operators have a concrete signal to act on.
+                    with suppress(Exception):
+                        await _ocr_unhandled_challenge(self, type_str)
 
             await self.page.wait_for_timeout(2000)
             await self.robotic_arm.refresh_challenge()
@@ -1006,6 +1011,26 @@ def _patch_robotic_arm_safety() -> None:
             res = await self._solve_captcha()
             self._epic_solve_attempts = 0
             return res
+
+async def _ocr_unhandled_challenge(agent: Any, type_str: str) -> None:
+    """OCR the captcha view for challenge types without a dedicated solver.
+
+    Best effort only — never raises, so it cannot affect the solve loop.
+    """
+    from settings import settings
+
+    if not settings.OCR_ENABLED:
+        return
+
+    from extensions.ocr_provider import CaptchaOCRClient
+
+    screenshot = await agent.page.screenshot(type="png")
+    text = await CaptchaOCRClient().recognize(screenshot)
+    if text:
+        logger.info("OCR | unhandled challenge type={} | recognized text={}", type_str, text)
+    else:
+        logger.debug("OCR | unhandled challenge type={} | no text recognized", type_str)
+
 
     AgentV._solve_captcha = safe_solve_captcha
     RoboticArm._epic_safety_patch = True
