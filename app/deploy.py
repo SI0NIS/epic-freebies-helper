@@ -70,7 +70,7 @@ def _is_free_game_rate_limit_error(err: Exception) -> bool:
     return False
 
 
-@logger.catch(reraise=True, diagnose=False)
+@logger.catch(reraise=True)
 async def execute_browser_tasks(headless: bool | str = True, *, collect_summary: bool = False):
     """
     Execute Epic Games free game collection tasks using browser automation.
