@@ -26,6 +26,7 @@ from hcaptcha_challenger.tools.spatial.base import SpatialReasoner
 from loguru import logger
 from playwright.async_api import Locator, TimeoutError as PlaywrightTimeoutError
 
+from extensions.llm_adapter import relay_blocked_endpoint
 from extensions.numbered_line_solver import solve_numbered_line_drag
 
 
@@ -921,6 +922,13 @@ def _patch_robotic_arm_safety() -> None:
     orig_solve_captcha = AgentV._solve_captcha
 
     async def safe_solve_captcha(self: AgentV):
+        # Relay already blocked by a gateway challenge: solving cannot succeed,
+        # so bail out immediately instead of waiting out every captcha timeout.
+        blocked_endpoint = relay_blocked_endpoint()
+        if blocked_endpoint is not None:
+            logger.error("🛑 中转站 {} 已被网关拦截，跳过验证码求解", blocked_endpoint)
+            return None
+
         attempts = getattr(self, "_epic_solve_attempts", 0) + 1
         self._epic_solve_attempts = attempts
         if attempts > 4:

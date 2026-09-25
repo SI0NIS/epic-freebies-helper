@@ -90,6 +90,70 @@ GLM_MULTI_TARGET_INSTRUCTION = (
 )
 
 
+GATEWAY_BLOCK_MARKERS = (
+    "just a moment",
+    "challenges.cloudflare.com",
+    "cf-browser-verification",
+    "attention required",
+    "enable javascript and cookies to continue",
+    "access denied",
+)
+
+#: Set once a relay/gateway answers with a bot challenge instead of JSON.
+#: Every later vision call then fails immediately instead of burning the
+#: retry budget (a blocked relay never recovers inside the same run).
+_BLOCKED_RELAY_ENDPOINT: str | None = None
+
+
+class RelayBlockedError(RuntimeError):
+    """The relay/gateway blocked the request before it reached the model API.
+
+    Typically a Cloudflare interstitial ("Just a moment...") served to IP
+    ranges the gateway distrusts -- e.g. GitHub Actions runners hosted
+    outside the relay's allowed region. Retrying cannot fix this.
+    """
+
+
+def relay_blocked_endpoint() -> str | None:
+    """Return the blocked relay endpoint, or None when the channel is healthy."""
+    return _BLOCKED_RELAY_ENDPOINT
+
+
+def _looks_like_gateway_block(response: "httpx.Response") -> bool:
+    """Detect an HTML bot-challenge page returned in place of a JSON API error."""
+    if response.status_code not in {401, 403, 429, 500, 502, 503}:
+        return False
+
+    if str(response.headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+
+    try:
+        body = response.text[:4000].lower()
+    except Exception:
+        return False
+
+    if not body:
+        return False
+
+    if any(marker in body for marker in GATEWAY_BLOCK_MARKERS):
+        return True
+
+    content_type = str(response.headers.get("content-type", "")).lower()
+    return "text/html" in content_type and body.lstrip().startswith("<!doctype html")
+
+
+def _mark_relay_blocked(endpoint: str):
+    global _BLOCKED_RELAY_ENDPOINT
+    if _BLOCKED_RELAY_ENDPOINT is None:
+        _BLOCKED_RELAY_ENDPOINT = endpoint
+        logger.error(
+            "🛑 中转站被网关拦截，本次运行后续请求将直接跳过（避免无意义重试） | "
+            "endpoint={} | 常见原因: Cloudflare 人机验证 / 出口 IP 不在白名单 / 地域封禁。"
+            "请更换允许 GitHub Actions 出口 IP 的通道，或把 runner 出口 IP 加进中转站白名单",
+            endpoint,
+        )
+
+
 def _glm_thinking_payload(model: str, config: Any) -> dict[str, str] | None:
     """Keep GLM point-selection calls within hCaptcha response budgets."""
     normalized = model.lower()
@@ -1219,7 +1283,7 @@ class _GLMAsyncModels:
 
         return payload
 
-    def _log_glm_error(self, response: httpx.Response):
+    def _log_glm_error(self, response: httpx.Response, endpoint: str = ""):
         body = response.text[:2000]
         code = ""
         message = ""
@@ -1228,6 +1292,17 @@ class _GLMAsyncModels:
             error = payload.get("error") or {}
             code = str(error.get("code") or "")
             message = str(error.get("message") or "")
+
+        if _looks_like_gateway_block(response):
+            logger.error(
+                "🛑 {} 请求被网关拦截（Cloudflare 人机验证 / 地域封禁），不是 key 或模型问题 | "
+                "http_status={} | endpoint={} | 片段={}",
+                self._label,
+                response.status_code,
+                endpoint,
+                (body or message)[:200].replace("\n", " "),
+            )
+            return
 
         if response.status_code == 429 or code in {"1302", "1303", "1304", "1308", "1113"}:
             logger.error(
@@ -1258,6 +1333,11 @@ class _GLMAsyncModels:
         )
 
     async def generate_content(self, model: str, contents: Any, **kwargs) -> _PatchedResponse:
+        if _BLOCKED_RELAY_ENDPOINT:
+            raise RelayBlockedError(
+                f"relay already blocked in this run: {_BLOCKED_RELAY_ENDPOINT}"
+            )
+
         config = kwargs.pop("config", None)
         if config is None:
             raise ValueError("config is required for GLM compatibility mode")
@@ -1299,7 +1379,12 @@ class _GLMAsyncModels:
                     f"({type(err).__name__})"
                 ) from err
             if response.is_error:
-                self._log_glm_error(response)
+                self._log_glm_error(response, endpoint)
+                if _looks_like_gateway_block(response):
+                    _mark_relay_blocked(endpoint)
+                    raise RelayBlockedError(
+                        f"relay blocked by gateway: HTTP {response.status_code} @ {endpoint}"
+                    )
                 response.raise_for_status()
             data = response.json()
 
@@ -1358,6 +1443,12 @@ def _limit_glm_provider_attempts(max_attempts: int = 2) -> bool:
     if retrying is None:
         return False
     retrying.stop = stop_after_attempt(max_attempts)
+
+    # A gateway block never clears within a run, so stop retrying on it.
+    with suppress(Exception):
+        from tenacity import retry_if_not_exception_type
+
+        retrying.retry = retrying.retry & retry_if_not_exception_type((RelayBlockedError,))
     return True
 
 

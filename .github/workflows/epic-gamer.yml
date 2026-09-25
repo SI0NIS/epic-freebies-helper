@@ -58,6 +58,12 @@ jobs:
       - name: Install Playwright Firefox fallback
         run: uv run playwright install firefox
 
+      # 中转站/网关常按出口 IP 做白名单或人机验证，打印出口 IP 便于排查 403。
+      - name: Print runner egress IP
+        run: |
+          echo "runner egress IPv4: $(curl -fsS --max-time 10 https://api.ipify.org || echo 'lookup failed')"
+          echo "runner egress IPv6: $(curl -fsS --max-time 10 https://api64.ipify.org || echo 'lookup failed')"
+
       - name: Run Epic Awesome Gamer
         env:
           EPIC_EMAIL: ${{ secrets.EPIC_EMAIL }}

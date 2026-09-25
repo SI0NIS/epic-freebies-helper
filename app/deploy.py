@@ -21,6 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 from pytz import timezone
 
+from extensions.llm_adapter import relay_blocked_endpoint
 from accounts import (
     get_epic_accounts_raw,
     mask_email,
@@ -185,6 +186,20 @@ async def execute_multiple_accounts(
 
     for index, email in enumerate(account_emails, 1):
         masked_email = mask_email(email)
+
+        # A gateway-blocked relay never recovers inside one run: short-circuit
+        # instead of burning another full login/captcha cycle per account.
+        blocked_endpoint = relay_blocked_endpoint()
+        if blocked_endpoint is not None:
+            logger.error(
+                "🛑 中转站 {} 已被网关拦截，跳过剩余 {} 个账号 | "
+                "请更换允许 GitHub Actions 出口 IP 的通道，或把 runner 出口 IP 加入白名单",
+                blocked_endpoint,
+                total - index + 1,
+            )
+            failed_accounts.extend(mask_email(item) for item in account_emails[index - 1 :])
+            break
+
         logger.info("=" * 60)
         logger.info("Processing account {}/{}: {}", index, total, masked_email)
         logger.info("=" * 60)
