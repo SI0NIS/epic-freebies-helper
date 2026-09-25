@@ -1053,9 +1053,33 @@ class _GLMAsyncFiles:
 
 
 class _GLMAsyncModels:
-    def __init__(self, settings: Any, storage: dict[str, dict[str, Any]]):
+    """OpenAI-compatible ``/chat/completions`` transport.
+
+    Shared by the GLM provider and by any OpenAI-compatible relay (中转站).
+    The wire protocol is identical for both — only the endpoint, credential,
+    timeout, optional model override and log label differ. When no override is
+    supplied the historical ``GLM_*`` settings are used, so GLM behaviour is
+    bit-for-bit unchanged.
+    """
+
+    def __init__(
+        self,
+        settings: Any,
+        storage: dict[str, dict[str, Any]],
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        timeout_seconds: float | None = None,
+        model_override: str = "",
+        label: str = "GLM",
+    ):
         self._settings = settings
         self._storage = storage
+        self._base_url = base_url
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._model_override = (model_override or "").strip()
+        self._label = label
 
     def _to_image_part(self, payload: bytes, mime_type: str) -> dict[str, Any]:
         encoded = base64.b64encode(payload).decode("utf-8")
@@ -1207,7 +1231,8 @@ class _GLMAsyncModels:
 
         if response.status_code == 429 or code in {"1302", "1303", "1304", "1308", "1113"}:
             logger.error(
-                "GLM quota/rate limit issue | http_status={} | code={} | message={}",
+                "{} quota/rate limit issue | http_status={} | code={} | message={}",
+                self._label,
                 response.status_code,
                 code,
                 message or body,
@@ -1216,7 +1241,8 @@ class _GLMAsyncModels:
 
         if response.status_code in {401, 403} or code in {"1000", "1001", "1002", "1003", "1004"}:
             logger.error(
-                "GLM auth issue | http_status={} | code={} | message={}",
+                "{} auth issue | http_status={} | code={} | message={}",
+                self._label,
                 response.status_code,
                 code,
                 message or body,
@@ -1224,7 +1250,11 @@ class _GLMAsyncModels:
             return
 
         logger.error(
-            "GLM request failed | status={} | code={} | body={}", response.status_code, code, body
+            "{} request failed | status={} | code={} | body={}",
+            self._label,
+            response.status_code,
+            code,
+            body,
         )
 
     async def generate_content(self, model: str, contents: Any, **kwargs) -> _PatchedResponse:
@@ -1232,17 +1262,32 @@ class _GLMAsyncModels:
         if config is None:
             raise ValueError("config is required for GLM compatibility mode")
 
-        endpoint = self._settings.GLM_BASE_URL.rstrip("/")
+        # Relay channel may force its own model name (hcaptcha-challenger would
+        # otherwise send whatever GEMINI_MODEL is set to).
+        if self._model_override:
+            model = self._model_override
+
+        base_url = self._base_url if self._base_url is not None else self._settings.GLM_BASE_URL
+        api_key = self._api_key if self._api_key is not None else self._settings.GLM_API_KEY
+        if api_key is not None and hasattr(api_key, "get_secret_value"):
+            api_key = api_key.get_secret_value()
+        timeout_value = (
+            self._timeout_seconds
+            if self._timeout_seconds is not None
+            else self._settings.GLM_REQUEST_TIMEOUT_SECONDS
+        )
+
+        endpoint = base_url.rstrip("/")
         if not endpoint.endswith("/chat/completions"):
             endpoint = f"{endpoint}/chat/completions"
 
         payload = self._build_payload(model=model, contents=contents, config=config, kwargs=kwargs)
         headers = {
-            "Authorization": f"Bearer {self._settings.GLM_API_KEY.get_secret_value()}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
-        request_timeout = float(self._settings.GLM_REQUEST_TIMEOUT_SECONDS)
+        request_timeout = float(timeout_value)
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
         ) as client:
@@ -1264,9 +1309,9 @@ class _GLMAsyncModels:
 
 
 class _GLMAsyncNamespace:
-    def __init__(self, settings: Any, storage: dict[str, dict[str, Any]]):
+    def __init__(self, settings: Any, storage: dict[str, dict[str, Any]], **overrides):
         self.files = _GLMAsyncFiles(storage)
-        self.models = _GLMAsyncModels(settings, storage)
+        self.models = _GLMAsyncModels(settings, storage, **overrides)
 
 
 class GLMCompatibleGenAIClient:
@@ -1275,6 +1320,31 @@ class GLMCompatibleGenAIClient:
 
         self._storage: dict[str, dict[str, Any]] = {}
         self.aio = _GLMAsyncNamespace(settings, self._storage)
+
+
+class OpenAICompatibleGenAIClient:
+    """``genai.Client`` replacement backed by any OpenAI-compatible relay (中转站).
+
+    Mirrors the channel contract used by ``src/ocr_any_provider.py``: point
+    ``OPENAI_BASE_URL`` at a gateway exposing ``/chat/completions`` with a
+    vision-capable model, supply ``OPENAI_API_KEY``, and pick ``OPENAI_MODEL``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        from settings import settings
+
+        self._storage: dict[str, dict[str, Any]] = {}
+        self.aio = _GLMAsyncNamespace(
+            settings,
+            self._storage,
+            base_url=settings.OPENAI_BASE_URL,
+            api_key=(
+                settings.OPENAI_API_KEY.get_secret_value() if settings.OPENAI_API_KEY else ""
+            ),
+            timeout_seconds=settings.OPENAI_REQUEST_TIMEOUT_SECONDS,
+            model_override=settings.OPENAI_MODEL,
+            label="OpenAI-relay",
+        )
 
 
 def _limit_glm_provider_attempts(max_attempts: int = 2) -> bool:
@@ -1368,6 +1438,26 @@ def apply_glm_patch(settings: Any):
         logger.error(f"❌ GLM 兼容补丁加载失败: {exc}")
 
 
+def apply_openai_patch(settings: Any):
+    """Route every vision call through an OpenAI-compatible relay (中转站)."""
+    if not settings.OPENAI_API_KEY:
+        return
+
+    try:
+        from google import genai
+
+        genai.Client = OpenAICompatibleGenAIClient
+        if not _limit_glm_provider_attempts():
+            logger.warning("Relay provider retry budget could not be configured")
+        logger.info(
+            "🚀 OpenAI 中转站补丁已应用 | 模型: {} | 地址: {}",
+            settings.OPENAI_MODEL,
+            settings.OPENAI_BASE_URL,
+        )
+    except Exception as exc:
+        logger.error(f"❌ OpenAI 中转站补丁加载失败: {exc}")
+
+
 def apply_llm_patch(settings: Any):
     provider = settings.LLM_PROVIDER.lower()
     if provider == "glm":
@@ -1375,6 +1465,15 @@ def apply_llm_patch(settings: Any):
             logger.error("LLM provider misconfigured | LLM_PROVIDER=glm but GLM_API_KEY is empty")
             return
         apply_glm_patch(settings)
+        return
+
+    if provider == "openai":
+        if not settings.OPENAI_API_KEY:
+            logger.error(
+                "LLM provider misconfigured | LLM_PROVIDER=openai but OPENAI_API_KEY is empty"
+            )
+            return
+        apply_openai_patch(settings)
         return
 
     if provider == "gemini" and not settings.GEMINI_API_KEY:

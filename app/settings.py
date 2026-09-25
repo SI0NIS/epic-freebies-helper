@@ -51,7 +51,7 @@ class EpicSettings(AgentConfig):
 
     GEMINI_MODEL: str = Field(default="gemini-2.5-pro", description="Gemini default model")
 
-    LLM_PROVIDER: str = Field(default="", description="Supported values: gemini, glm")
+    LLM_PROVIDER: str = Field(default="", description="Supported values: gemini, glm, openai")
 
     GLM_API_KEY: SecretStr | None = Field(default=None, description="GLM API key")
 
@@ -61,6 +61,19 @@ class EpicSettings(AgentConfig):
 
     GLM_MODEL: str = Field(default="glm-4.6v", description="GLM vision-capable default model")
     GLM_REQUEST_TIMEOUT_SECONDS: float = Field(default=90.0, gt=5.0, le=180.0)
+
+    # OpenAI-compatible relay (中转站) channel: any gateway exposing /chat/completions
+    # with a vision-capable model (see src/ocr_any_provider.py for the same contract).
+    OPENAI_API_KEY: SecretStr | None = Field(
+        default=None, description="OpenAI-compatible relay (中转站) API key"
+    )
+    OPENAI_BASE_URL: str = Field(
+        default="https://api.openai.com/v1", description="OpenAI-compatible relay base URL"
+    )
+    OPENAI_MODEL: str = Field(
+        default="gpt-4o-mini", description="Vision-capable model served by the relay"
+    )
+    OPENAI_REQUEST_TIMEOUT_SECONDS: float = Field(default=90.0, gt=5.0, le=180.0)
 
     BROWSER_BACKEND: str = Field(
         default="auto", description="Supported values: auto, camoufox, playwright"
@@ -106,14 +119,17 @@ class EpicSettings(AgentConfig):
         provider = str(data.get("LLM_PROVIDER") or "").strip().lower()
         glm_key = _coerce_secret_input(data.get("GLM_API_KEY"))
         gemini_key = _coerce_secret_input(data.get("GEMINI_API_KEY"))
+        openai_key = _coerce_secret_input(data.get("OPENAI_API_KEY"))
 
-        if provider not in {"gemini", "glm"}:
+        if provider not in {"gemini", "glm", "openai"}:
             data["LLM_PROVIDER"] = "glm" if glm_key else "gemini"
 
         # `hcaptcha-challenger` still expects GEMINI_API_KEY in its base settings model.
-        # Seed it before field validation so GLM-only environments work in local runs and CI.
+        # Seed it before field validation so GLM/OpenAI-relay-only environments work in CI.
         if gemini_key is None and glm_key is not None:
             data["GEMINI_API_KEY"] = glm_key
+        elif gemini_key is None and openai_key is not None:
+            data["GEMINI_API_KEY"] = openai_key
 
         return data
 
@@ -125,6 +141,8 @@ class EpicSettings(AgentConfig):
             "LLM_PROVIDER",
             "GLM_BASE_URL",
             "GLM_MODEL",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
             "BROWSER_BACKEND",
             "EPIC_EMAIL",
             "CHALLENGE_CLASSIFIER_MODEL",
@@ -137,14 +155,21 @@ class EpicSettings(AgentConfig):
                 setattr(self, field_name, value.strip())
 
         provider = (self.LLM_PROVIDER or "").strip().lower()
-        if provider not in {"gemini", "glm"}:
+        if provider not in {"gemini", "glm", "openai"}:
             provider = "glm" if self.GLM_API_KEY else "gemini"
         self.LLM_PROVIDER = provider
 
         if self.GEMINI_API_KEY is None and self.GLM_API_KEY is not None:
             self.GEMINI_API_KEY = self.GLM_API_KEY
+        elif self.GEMINI_API_KEY is None and self.OPENAI_API_KEY is not None:
+            self.GEMINI_API_KEY = self.OPENAI_API_KEY
 
-        provider_default = self.GLM_MODEL if provider == "glm" else self.GEMINI_MODEL
+        if provider == "glm":
+            provider_default = self.GLM_MODEL
+        elif provider == "openai":
+            provider_default = self.OPENAI_MODEL
+        else:
+            provider_default = self.GEMINI_MODEL
         if not self.CHALLENGE_CLASSIFIER_MODEL:
             self.CHALLENGE_CLASSIFIER_MODEL = provider_default
         if not self.IMAGE_CLASSIFIER_MODEL:
@@ -187,6 +212,13 @@ class EpicSettings(AgentConfig):
                 "Invalid LLM configuration: LLM_PROVIDER=gemini but GEMINI_API_KEY is empty. "
                 "Set GEMINI_API_KEY in GitHub Actions Secrets, or switch LLM_PROVIDER to glm "
                 "if you intend to use GLM."
+            )
+
+        if provider == "openai" and self.OPENAI_API_KEY is None:
+            return (
+                "Invalid LLM configuration: LLM_PROVIDER=openai but OPENAI_API_KEY is empty. "
+                "Set OPENAI_API_KEY (and OPENAI_BASE_URL / OPENAI_MODEL) in GitHub Actions "
+                "Secrets to use an OpenAI-compatible relay (中转站)."
             )
 
         return None

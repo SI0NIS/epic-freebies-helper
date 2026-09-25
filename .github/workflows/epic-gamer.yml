@@ -79,6 +79,11 @@ jobs:
           GLM_BASE_URL: ${{ secrets.GLM_BASE_URL }}
           GLM_MODEL: ${{ vars.GLM_MODEL || secrets.GLM_MODEL }}
           GLM_REQUEST_TIMEOUT_SECONDS: ${{ vars.GLM_REQUEST_TIMEOUT_SECONDS || 90.0 }}
+          # OpenAI-compatible relay (中转站) channel
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          OPENAI_REQUEST_TIMEOUT_SECONDS: ${{ vars.OPENAI_REQUEST_TIMEOUT_SECONDS || 90.0 }}
           AUTH_MAX_ATTEMPTS: ${{ vars.AUTH_MAX_ATTEMPTS || 2 }}
           TASK_TIMEOUT_SECONDS: ${{ vars.TASK_TIMEOUT_SECONDS || 1800 }}
           CHALLENGE_CLASSIFIER_MODEL: ${{ vars.CHALLENGE_CLASSIFIER_MODEL || secrets.CHALLENGE_CLASSIFIER_MODEL }}
