@@ -1452,6 +1452,33 @@ def _limit_glm_provider_attempts(max_attempts: int = 2) -> bool:
     return True
 
 
+def _harden_gemini_provider_retries(max_attempts: int = 5) -> bool:
+    """Absorb transient Gemini 503 "high demand" spikes.
+
+    The bundled provider retries only 3 times with a fixed 3-second wait (~6s of
+    sleep in total), which is far too short when the model is briefly overloaded:
+    ``ServerError 503 UNAVAILABLE — This model is currently experiencing high
+    demand`` then fails the entire captcha solve. Widen the budget and switch to
+    exponential backoff so short capacity spikes ride through instead of aborting.
+
+    Kept deliberately modest so the cumulative backoff (~40s worst case) still
+    fits inside the provider's EXECUTION_TIMEOUT (120s) solve budget.
+    """
+    try:
+        from hcaptcha_challenger.tools.internal.providers.gemini import GeminiProvider
+        from tenacity import stop_after_attempt, wait_exponential
+    except ImportError:
+        return False
+
+    retrying = getattr(GeminiProvider.generate_with_images, "retry", None)
+    if retrying is None:
+        return False
+
+    retrying.stop = stop_after_attempt(max_attempts)
+    retrying.wait = wait_exponential(multiplier=2, min=3, max=12)
+    return True
+
+
 def apply_gemini_patch(settings: Any):
     if not settings.GEMINI_API_KEY:
         return
@@ -1508,6 +1535,11 @@ def apply_gemini_patch(settings: Any):
         genai.files.AsyncFiles.upload = patched_upload
         genai.models.AsyncModels.generate_content = patched_generate
         logger.info("🚀 Gemini 文件上传兼容补丁加载成功")
+
+        if _harden_gemini_provider_retries():
+            logger.info("🛡️ Gemini 过载(503)重试已强化 | 最多 5 次 + 指数退避")
+        else:
+            logger.warning("Gemini provider retry budget could not be widened")
     except Exception as exc:
         logger.error(f"❌ Gemini 兼容补丁加载失败: {exc}")
 
