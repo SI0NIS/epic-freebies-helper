@@ -58,6 +58,32 @@ TIMEZONE = timezone("Asia/Shanghai")
 RATE_LIMITED_OUTCOME = "rate_limited"
 
 
+def _parse_account_models() -> list[str]:
+    """Parse ``ACCOUNT_MODELS`` into an ordered per-account reasoning-model list.
+
+    Empty/unset means "no per-account routing" and preserves the legacy behavior
+    where every account shares the configured default reasoning model.
+    """
+    raw = (settings.ACCOUNT_MODELS or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _apply_reasoning_model(model: str) -> None:
+    """Point every reasoning stage at ``model`` for the account that runs next.
+
+    ``AgentV``/``RoboticArm`` read these fields from the shared settings object
+    when they are constructed inside ``EpicAuthorization._login`` — which happens
+    once per account — so mutating them here routes the *next* account to a
+    different model (and therefore a different free-tier quota bucket).
+    """
+    settings.CHALLENGE_CLASSIFIER_MODEL = model
+    settings.IMAGE_CLASSIFIER_MODEL = model
+    settings.SPATIAL_POINT_REASONER_MODEL = model
+    settings.SPATIAL_PATH_REASONER_MODEL = model
+
+
 def _is_free_game_rate_limit_error(err: Exception) -> bool:
     current: BaseException | None = err
     seen: set[int] = set()
@@ -184,6 +210,16 @@ async def execute_multiple_accounts(
     rate_limited_accounts: list[str] = []
     failed_accounts: list[str] = []
 
+    # Per-account model routing (optional). Capture the configured defaults so a
+    # short ACCOUNT_MODELS list can fall back cleanly for the extra accounts.
+    account_models = _parse_account_models()
+    baseline_models = (
+        settings.CHALLENGE_CLASSIFIER_MODEL,
+        settings.IMAGE_CLASSIFIER_MODEL,
+        settings.SPATIAL_POINT_REASONER_MODEL,
+        settings.SPATIAL_PATH_REASONER_MODEL,
+    )
+
     for index, email in enumerate(account_emails, 1):
         masked_email = mask_email(email)
 
@@ -203,6 +239,27 @@ async def execute_multiple_accounts(
         logger.info("=" * 60)
         logger.info("Processing account {}/{}: {}", index, total, masked_email)
         logger.info("=" * 60)
+
+        # Route this account to its own model (and therefore its own quota bucket).
+        if account_models:
+            if index - 1 < len(account_models):
+                chosen_model = account_models[index - 1]
+                _apply_reasoning_model(chosen_model)
+                logger.info(
+                    "Account {}/{} reasoning model: {}", index, total, chosen_model
+                )
+            else:
+                (
+                    settings.CHALLENGE_CLASSIFIER_MODEL,
+                    settings.IMAGE_CLASSIFIER_MODEL,
+                    settings.SPATIAL_POINT_REASONER_MODEL,
+                    settings.SPATIAL_PATH_REASONER_MODEL,
+                ) = baseline_models
+                logger.info(
+                    "Account {}/{} has no ACCOUNT_MODELS entry; using the default reasoning model",
+                    index,
+                    total,
+                )
 
         try:
             # Swap active credentials. The password is resolved internally by

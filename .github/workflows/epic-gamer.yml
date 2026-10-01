@@ -96,6 +96,8 @@ jobs:
           IMAGE_CLASSIFIER_MODEL: ${{ vars.IMAGE_CLASSIFIER_MODEL || secrets.IMAGE_CLASSIFIER_MODEL }}
           SPATIAL_POINT_REASONER_MODEL: ${{ vars.SPATIAL_POINT_REASONER_MODEL || secrets.SPATIAL_POINT_REASONER_MODEL }}
           SPATIAL_PATH_REASONER_MODEL: ${{ vars.SPATIAL_PATH_REASONER_MODEL || secrets.SPATIAL_PATH_REASONER_MODEL }}
+          # 按账号指定推理模型（逗号分隔，按账号顺序），如 "gemini-3.8-flash,gemini-3.7-flash"
+          ACCOUNT_MODELS: ${{ vars.ACCOUNT_MODELS || secrets.ACCOUNT_MODELS }}
           BROWSER_BACKEND: auto
           BROWSER_PROXY: ${{ secrets.BROWSER_PROXY }}
           HEADLESS: virtual

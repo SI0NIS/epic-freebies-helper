@@ -103,6 +103,16 @@ class EpicSettings(AgentConfig):
     )
     WAIT_FOR_CHALLENGE_VIEW_TO_RENDER_MS: int = Field(default=3000)
 
+    # Per-account reasoning-model routing: a comma-separated list with one entry
+    # per account position, e.g. "gemini-3.8-flash,gemini-3.7-flash". When set,
+    # every reasoning stage for account N uses entry N, so each account can draw on
+    # a different model's independent free-tier quota instead of sharing one bucket.
+    ACCOUNT_MODELS: str = Field(
+        default="",
+        description="Comma-separated per-account reasoning models, "
+        "e.g. 'gemini-3.8-flash,gemini-3.7-flash'.",
+    )
+
     CHALLENGE_CLASSIFIER_MODEL: str = Field(default="")
     IMAGE_CLASSIFIER_MODEL: str = Field(default="")
     SPATIAL_POINT_REASONER_MODEL: str = Field(default="")
@@ -152,6 +162,7 @@ class EpicSettings(AgentConfig):
             "GLM_MODEL",
             "OPENAI_BASE_URL",
             "OPENAI_MODEL",
+            "ACCOUNT_MODELS",
             "BROWSER_BACKEND",
             "EPIC_EMAIL",
             "CHALLENGE_CLASSIFIER_MODEL",
