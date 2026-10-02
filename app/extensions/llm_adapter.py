@@ -155,8 +155,18 @@ def _mark_relay_blocked(endpoint: str):
 
 
 def _glm_thinking_payload(model: str, config: Any) -> dict[str, str] | None:
-    """Keep GLM point-selection calls within hCaptcha response budgets."""
+    """Keep outgoing vision calls within hCaptcha's per-attempt response budget.
+
+    Slow "thinking" modes make a single vision call take 90-180s+, which blows
+    the challenge solve budget (EXECUTION_TIMEOUT) before an answer is produced.
+    """
     normalized = model.lower()
+
+    # Moonshot Kimi K-series: force "instant" mode. Verified via run 36966402603
+    # that the default (thinking) mode exceeds the 180s request timeout.
+    if normalized.startswith("kimi-k"):
+        return {"type": "disabled"}
+
     if not (
         normalized.startswith("glm-4.5")
         or normalized.startswith("glm-4.6")
